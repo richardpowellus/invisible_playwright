@@ -350,6 +350,23 @@ class Lifecycle:
                     # BEFORE ours is not ours, no matter what it says.
                     if navigation is not None and not f.follows(navigation):
                         pass
+                    # ⛔ AND networkidle MUST ALSO WAIT FOR OUR DOCUMENT.
+                    # `_reached` reads one page-wide request counter, which
+                    # knows nothing about navigations. With a `beforeunload`
+                    # listener on the page being left, Firefox sends
+                    # `navigationStarted` BEFORE the new document's request:
+                    # `follows` is then true, the counter is zero and has been
+                    # quiet for seconds - the OLD page's silence - and the
+                    # wait was reached before the new page had been asked
+                    # for. Measured 2026-10-03 leaving Amex's login page:
+                    # `goto(..., "networkidle")` returned in 78 ms with no
+                    # Response, still on Amex, and the MCP server called it
+                    # a same-document navigation. `load` is cleared on
+                    # `navigationStarted`, so requiring it means the quiet
+                    # is measured on a document that belongs to us.
+                    elif (state == "networkidle" and navigation is not None
+                          and "load" not in f.states):
+                        pass
                     elif self._reached(f, state):
                         return
                 remaining = deadline - time.monotonic()
