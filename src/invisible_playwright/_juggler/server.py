@@ -26,6 +26,7 @@ hard failure. Everything here creates first and returns the channel second.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -1548,8 +1549,12 @@ class RouteDispatcher(Dispatcher):
         self.answered = True
         params = dict(params)
         params["requestId"] = self.request.request_id
-        result = self.conn.send(
-            command, params, timeout=30)
+        # ⛔ ON THE PAGE'S SESSION. The three interception commands are
+        # `Network.*`, which Juggler serves per page; sent on the browser
+        # session they came back "Handler for does not implement method", the
+        # held request was never released and the page hung on its first
+        # request. Every route that ever reached a handler failed this way.
+        result = self.request.page.send(command, params)
         self.dispose()
         return result
 
@@ -1640,11 +1645,17 @@ class PageDispatcher(Dispatcher):
         "webStorageClear": "op_storage_clear",
         "runBeforeUnload": "op_run_before_unload",
         "addInitScript": "op_add_init_script",
+        "setNetworkInterceptionPatterns": "op_set_interception",
     }
 
     def __init__(self, server, context: "BrowserContextDispatcher",
-                 session: str, target_id: str) -> None:
+                 session: str, target_id: str,
+                 opener: Optional["PageDispatcher"] = None) -> None:
         self.context = context
+        #: True while `page.route()` holds this page's requests. The context
+        #: keeps its own flag: a request is offered to the page's handlers
+        #: first, and the client falls through to the context's.
+        self.intercepting = False
         self.session = session
         self.target_id = target_id
         # The id Juggler gave the running screencast, or None. One per page,
@@ -1670,6 +1681,26 @@ class PageDispatcher(Dispatcher):
         # which needs the main frame this replay is what delivers. The events
         # that precede a page describe its birth, and the initializer built
         # below carries that - the main frame is in it by name.
+        # ⛔ THIS PAGE'S OWN NETWORK EVENTS ARE HELD FROM HERE, not dropped. A
+        # page the SITE opened has usually sent its document request, and had
+        # the response, before this object exists: a PDF in a new tab was
+        # requested, answered and handed to the viewer while the main frame
+        # was still being awaited below. Delivered to nobody, that response
+        # never reached `context.on("response")`, so its body - the only copy
+        # of a file the viewer cannot give back - was out of reach (measured
+        # 2026-10-01: only the favicon's responses arrived). The subscriber is
+        # registered before the replay so the buffered events reach it too,
+        # and it holds rather than handles until the channel exists.
+        self._held: Optional[List] = []
+        self._held_lock = threading.Lock()
+        conn.add_listener(self._route_juggler_event)
+        try:
+            self._build(server, context, session, conn, opener)
+        except BaseException:
+            conn.remove_listener(self._route_juggler_event)
+            raise
+
+    def _build(self, server, context, session, conn, opener) -> None:
         replayed = context.browser.replay(session, conn.dispatch_event)
         self.replayed_events = replayed
         self._frames: Dict[str, Any] = {}
@@ -1698,9 +1729,13 @@ class PageDispatcher(Dispatcher):
         self.frame = FrameDispatcher(server, self, self.main_frame_id)
         viewport = context.options.get("viewport") or {"width": 1280,
                                                        "height": 720}
-        super().__init__(server, context,
-                         {"mainFrame": self.frame.channel,
-                          "viewportSize": viewport, "isClosed": False})
+        initializer = {"mainFrame": self.frame.channel,
+                       "viewportSize": viewport, "isClosed": False}
+        # The client emits `popup` on the opener from the context's `page`
+        # event, and only when the new page names its opener here.
+        if opener is not None and not opener.disposed:
+            initializer["opener"] = opener.channel
+        super().__init__(server, context, initializer)
         self.emit("__adopt__", {"guid": self.frame.guid})
         self.frame.parent = self
         # ⛔ AFTER the Page exists: an event that fires during construction
@@ -1745,15 +1780,44 @@ class PageDispatcher(Dispatcher):
         no error at all: the handler simply never runs, and the user concludes
         their page prints nothing.
         """
-        # ⛔ Registered on the connection's list, never chained. The isolation
-        # that used to live in this closure is now `dispatch_event`'s job and
-        # covers every subscriber instead of just this one.
-        self.conn.add_listener(self._route_juggler_event)
+        # ⛔ Registered on the connection's list, never chained, and already
+        # in `__init__`: what is left here is to stop holding. Only the
+        # NETWORK events held are delivered - the rest describe the page's
+        # birth, which the initializer already carries, and replaying a main
+        # frame's `frameAttached` would announce it twice. Delivered under the
+        # lock, so a live event waits for the held ones and keeps their order:
+        # a response handled before its request is dropped as unknown.
+        #
+        # ⛔ AND EACH EVENT ONCE, AT ITS LAST PLACE. One that arrived after this
+        # subscriber was registered but before the replay marked the session
+        # live was both buffered by the browser and held here, so the replay
+        # hands it over a second time, behind events older than it. It is the
+        # same params object both times; keeping its last occurrence restores
+        # the order the engine sent them in and announces each request once.
+        with self._held_lock:
+            held, self._held = self._held or [], None
+            last = {id(params): i for i, (_, params) in enumerate(held)}
+            for i, (method, params) in enumerate(held):
+                if last[id(params)] == i and method.startswith("Network."):
+                    with contextlib.suppress(Exception):
+                        self._on_juggler_event(method, params)
 
     def _route_juggler_event(self, method: str, params: Dict,
                              session) -> None:
-        if session == self.session:
-            self._on_juggler_event(method, params)
+        if session != self.session:
+            return
+        if self._held is not None:
+            with self._held_lock:
+                if self._held is not None:
+                    if len(self._held) < self.HELD_CAP:
+                        self._held.append((method, params))
+                    return
+        self._on_juggler_event(method, params)
+
+    #: Events held while the page is being built. The birth of a page is a
+    #: burst of a few dozen; a page that never finishes building must not
+    #: grow this without bound.
+    HELD_CAP = 512
 
     def _detach_listeners(self) -> None:
         """Unsubscribe this page and everything it owns.
@@ -1881,10 +1945,8 @@ class PageDispatcher(Dispatcher):
                 self._remember_navigation(request)
             self.context.emit("request", {"request": request.channel,
                                           "page": self.channel})
-            if self.context.intercepting and params.get("isIntercepted"):
-                route = RouteDispatcher(self.server, request)
-                self.context.emit("route", {"route": route.channel,
-                                            "page": self.channel})
+            if params.get("isIntercepted"):
+                self._offer_route(request)
         elif method == "Network.responseReceived":
             request = self._requests.get(params.get("requestId"))
             if request is not None:
@@ -2046,6 +2108,47 @@ class PageDispatcher(Dispatcher):
             load_states=sorted(getattr(frame, "states", []) or []) or ["commit"])
         self._frames[frame_id] = made
         return made
+
+    def op_set_interception(self, params: Dict) -> Any:
+        """`page.route()`: hold this page's requests until a handler answers.
+
+        It was missing, and the dispatcher refused it as a gap. Juggler's
+        `Network.setRequestInterception` is per page and, like the context's,
+        a boolean: the client filters by url and continues what it does not
+        want.
+        """
+        wanted = bool(params.get("patterns"))
+        if wanted:
+            self.browser.require_interception("page.route()")
+        self.send("Network.setRequestInterception", {"enabled": wanted})
+        self.intercepting = wanted
+        return None
+
+    def _offer_route(self, request: "RequestDispatcher") -> None:
+        """Hand a held request to whoever asked to hold it.
+
+        ⛔ THE PAGE'S CHANNEL WHEN THE PAGE ASKED, the context's otherwise. The
+        client's `Page._on_route` runs the page's handlers and then falls
+        through to the context's, so a request emitted on the page reaches
+        both; one emitted on the context never reaches a `page.route()`.
+
+        ⛔ AND A HELD REQUEST NOBODY CLAIMS IS RELEASED HERE. Interception can
+        be switched off while a request is already held; emitting nothing
+        would leave it held for ever and hang the page silently.
+        """
+        if self.intercepting:
+            owner = self
+        elif self.context.intercepting:
+            owner = self.context
+        else:
+            try:
+                self.send("Network.resumeInterceptedRequest",
+                          {"requestId": request.request_id})
+            except Exception:
+                pass
+            return
+        route = RouteDispatcher(self.server, request)
+        owner.emit("route", {"route": route.channel, "page": self.channel})
 
     def send(self, command: str, params: Dict) -> Any:
         """A Juggler command on THIS page's session.
@@ -2716,6 +2819,13 @@ def _address(context_id: Optional[str], params: Dict) -> Dict:
     return out
 
 
+#: Playwright's `serviceWorkers: 'block'`, verbatim.
+_BLOCK_SERVICE_WORKERS = (
+    "\nif (navigator.serviceWorker) navigator.serviceWorker.register = "
+    "async () => { console.warn('Service Worker registration blocked by "
+    "Playwright'); };\n")
+
+
 class BrowserContextDispatcher(Dispatcher):
     TYPE = "BrowserContext"
     METHODS = {
@@ -2807,6 +2917,19 @@ class BrowserContextDispatcher(Dispatcher):
                                       lambda: self._remove_init_script(source))
         return {"disposable": handle.channel}
 
+    def block_service_workers_if_asked(self) -> None:
+        """`service_workers="block"`, done the way Playwright does it.
+
+        ⛔ IT WAS ACCEPTED AND DROPPED. The option arrived with the context and
+        nothing read it, so a caller who blocked service workers to keep
+        `route()` in charge of every request had blocked nothing. Playwright's
+        own server replaces `navigator.serviceWorker.register` with an init
+        script (`browserContext.ts`, `initialize()`); this is the same script,
+        so a page sees exactly what it would see under Playwright.
+        """
+        if self.options.get("serviceWorkers") == "block":
+            self.op_context_init_script({"source": _BLOCK_SERVICE_WORKERS})
+
     def _remove_init_script(self, source: str) -> None:
         """Undo one context-level init script, on both sides it was added to."""
         if source in self._init_scripts:
@@ -2852,6 +2975,8 @@ class BrowserContextDispatcher(Dispatcher):
         is the reason `route()` on a busy page is slower here than upstream.
         """
         wanted = bool(params.get("patterns"))
+        if wanted:
+            self.browser.require_interception("context.route()")
         self._browser_send("Browser.setRequestInterception",
                            {"enabled": wanted})
         self.intercepting = wanted
@@ -2998,8 +3123,17 @@ class BrowserDispatcher(Dispatcher):
 
     def __init__(self, server, browser_type: "BrowserTypeDispatcher",
                  conn: Any, version: str, session_seed: Any = None,
-                 motion_budget_s: Any = None) -> None:
+                 motion_budget_s: Any = None,
+                 service_workers_enabled: bool = True) -> None:
         self.conn = conn
+        #: ⛔ WHETHER `route()` CAN WORK AT ALL. Firefox asks a channel's
+        #: intercept controller - the hook Juggler holds requests through -
+        #: only while `dom.serviceWorkers.enabled` is true; with it false the
+        #: engine accepts `setRequestInterception`, holds nothing, and every
+        #: request goes out. Measured 2026-10-02: a context route set as a
+        #: guard saw zero requests while two POSTs and a beacon reached the
+        #: server. See `require_interception`.
+        self.service_workers_enabled = service_workers_enabled
         self.browser_type = browser_type
         #: ⛔ THE SESSION'S SEED, and the reason it lives on the BROWSER rather
         #: than on this module: a process can hold two sessions with two seeds,
@@ -3062,18 +3196,104 @@ class BrowserDispatcher(Dispatcher):
                           "browserName": "firefox"})
         self.contexts: List[BrowserContextDispatcher] = []
 
+    def require_interception(self, what: str) -> None:
+        """Refuse a route this browser cannot honour, instead of ignoring it.
+
+        ⛔ FAIL CLOSED. A route is often a guard - "abort every POST" - and a
+        guard that is accepted and never runs is worse than none: the caller
+        believes it is protected. `service_workers="block"` on the context
+        stops registrations the way Playwright does and keeps routing working.
+        """
+        if not self.service_workers_enabled:
+            raise ProtocolException(
+                "%s cannot intercept anything in this browser: it was launched "
+                "with dom.serviceWorkers.enabled=false, and Firefox only offers "
+                "a request to the interception hook while that pref is true, "
+                "so every request would go out unseen. Drop the pref and pass "
+                "service_workers=\"block\" to new_context() instead" % what)
+
     def _route_browser_event(self, method: str, params: Dict, session) -> None:
         if method == "Browser.attachedToTarget":
             info = params.get("targetInfo") or {}
             with self._sessions_ready:
                 self._sessions[info.get("targetId")] = params.get("sessionId")
                 self._sessions_ready.notify_all()
+            # ⛔ A PAGE THE SITE OPENED HAS NO `newPage` TO ANSWER FOR IT. A
+            # `target=_blank` link, `window.open`, or a PDF attachment Firefox
+            # shows in a tab of its own arrives only as this event, with
+            # `openerId` set. Nothing built a Page for it, so the tab existed in
+            # the browser and nowhere else: `context.pages` never listed it,
+            # `expect_page`/`expect_popup` timed out, and its network events sat
+            # in the buffer below until the cap. Measured 2026-10-01 on a link
+            # to a PDF in a new tab: the target attached, no `page` event. Pages
+            # this server opens itself carry no opener, so this never builds a
+            # second Page for one `op_new_page` is already building.
+            if info.get("type") == "page" and info.get("openerId"):
+                threading.Thread(
+                    target=self._adopt_opened_page,
+                    args=(info, params.get("sessionId")),
+                    name="adopt-%s" % info.get("targetId"), daemon=True).start()
+        elif method == "Browser.detachedFromTarget":
+            # ⛔ A PAGE THE SITE CLOSED (`window.close()`, a viewer tab that
+            # gave way to a download) stayed open to the client forever: only
+            # `page.close()` and `context.close()` ever announced a close.
+            # `announce_closed` is once-guarded, so the detach that follows
+            # those two changes nothing.
+            page = self._page_for_session(params.get("sessionId"))
+            if page is not None:
+                threading.Thread(target=self._page_gone, args=(page,),
+                                 daemon=True).start()
         if session:
             with self._buffer_lock:
                 if session not in self._live:
                     held = self._buffered.setdefault(session, [])
                     if len(held) < self.BUFFER_CAP:
                         held.append((method, params))
+
+    def _context_for(self, context_id: Optional[str]):
+        for context in list(self.contexts):
+            if context.context_id == context_id and not context.disposed:
+                return context
+        return None
+
+    def _page_for_session(self, session: Optional[str]):
+        for context in list(self.contexts):
+            for page in list(context.pages):
+                if page.session == session:
+                    return page
+        return None
+
+    def _adopt_opened_page(self, info: Dict, session: Optional[str]) -> None:
+        """Build the Page for a target the site opened, OFF the reader thread:
+        a Page waits for its main frame, which only the reader can deliver."""
+        context = self._context_for(info.get("browserContextId"))
+        if context is None or not session:
+            # A context this server never handed out (or already closed) has no
+            # client object to hold the page; drop what was buffered for it.
+            if session:
+                self.forget(session)
+            return
+        opener = None
+        for page in list(context.pages):
+            if page.target_id == info.get("openerId"):
+                opener = page
+        try:
+            page = PageDispatcher(self.server, context, session,
+                                  info.get("targetId"), opener=opener)
+        except Exception:
+            # A tab closed before it finished opening: nothing to announce.
+            self.forget(session)
+            return
+        context.pages.append(page)
+        context.emit("page", {"page": page.channel})
+
+    def _page_gone(self, page: "PageDispatcher") -> None:
+        with contextlib.suppress(Exception):
+            self.forget(page.session)
+        with contextlib.suppress(ValueError):
+            page.context.pages.remove(page)
+        with contextlib.suppress(Exception):
+            page.announce_closed()
 
     def replay(self, session: str, deliver) -> int:
         """Hand a new consumer the events of its session that it missed.
@@ -3167,6 +3387,7 @@ class BrowserDispatcher(Dispatcher):
         self._apply_context_options(context_id, params)
         context = BrowserContextDispatcher(self.server, self, params,
                                            context_id)
+        context.block_service_workers_if_asked()
         self.contexts.append(context)
         self.emit("context", {"context": context.channel})
         return {"context": context.channel}
@@ -3309,6 +3530,7 @@ class BrowserDispatcher(Dispatcher):
         """
         self._apply_context_options(None, params)
         context = BrowserContextDispatcher(self.server, self, params, None)
+        context.block_service_workers_if_asked()
         self.contexts.append(context)
         self.emit("context", {"context": context.channel})
         return {"context": context.channel}
@@ -3478,9 +3700,11 @@ class BrowserTypeDispatcher(Dispatcher):
             # swallows one hook's failure so it cannot stop the others.
             self.server.on_shutdown(lambda: _remove_profile(profile))
         version = _read_version(executable)
-        browser = BrowserDispatcher(self.server, self, conn, version,
-                                    session_seed=session_seed,
-                                    motion_budget_s=motion_budget_s)
+        browser = BrowserDispatcher(
+            self.server, self, conn, version, session_seed=session_seed,
+            motion_budget_s=motion_budget_s,
+            service_workers_enabled=prefs.get(
+                "dom.serviceWorkers.enabled") is not False)
         return {"browser": browser.channel}
 
 
