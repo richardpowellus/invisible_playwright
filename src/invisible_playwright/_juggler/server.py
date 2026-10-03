@@ -1706,7 +1706,8 @@ class PageDispatcher(Dispatcher):
     }
 
     def __init__(self, server, context: "BrowserContextDispatcher",
-                 session: str, target_id: str) -> None:
+                 session: str, target_id: str,
+                 opener: Optional["PageDispatcher"] = None) -> None:
         self.context = context
         self.session = session
         self.target_id = target_id
@@ -1716,9 +1717,6 @@ class PageDispatcher(Dispatcher):
         conn = context.browser.conn
         self.lifecycle = Lifecycle(conn, session)
         self.injected = InjectedScript(conn, session)
-        self.injected.install()
-        self.actions = context.browser.actions_for_page(
-            session, self.lifecycle, self.injected)
         # ⛔ THE EVENTS THIS PAGE ALREADY MISSED, handed over now that the two
         # things that need them exist. `Page.frameAttached` and the
         # `Runtime.executionContextCreated` pair are sent by the browser BEFORE
@@ -1732,7 +1730,29 @@ class PageDispatcher(Dispatcher):
         # which needs the main frame this replay is what delivers. The events
         # that precede a page describe its birth, and the initializer built
         # below carries that - the main frame is in it by name.
-        replayed = context.browser.replay(session, conn.dispatch_event)
+        self._held: Optional[List] = []
+        self._held_lock = threading.Lock()
+        self._replayed: List = []
+        conn.add_listener(self._route_juggler_event)
+        try:
+            self.injected.install()
+            self.actions = context.browser.actions_for_page(
+                session, self.lifecycle, self.injected)
+            self._build(server, context, session, conn, opener)
+        except BaseException:
+            self._detach_listeners()
+            if hasattr(self, "guid"):
+                self.dispose()
+            elif hasattr(self, "frame"):
+                self.frame.dispose()
+            raise
+
+    def _build(self, server, context, session, conn, opener) -> None:
+        def replay_event(method, params, event_session):
+            self._replayed.append((method, params))
+            conn.dispatch_event(method, params, event_session)
+
+        replayed = context.browser.replay(session, replay_event)
         self.replayed_events = replayed
         self._frames: Dict[str, Any] = {}
         self._requests: Dict[str, Any] = {}
@@ -1760,9 +1780,11 @@ class PageDispatcher(Dispatcher):
         self.frame = FrameDispatcher(server, self, self.main_frame_id)
         viewport = context.options.get("viewport") or {"width": 1280,
                                                        "height": 720}
-        super().__init__(server, context,
-                         {"mainFrame": self.frame.channel,
-                          "viewportSize": viewport, "isClosed": False})
+        initializer = {"mainFrame": self.frame.channel,
+                       "viewportSize": viewport, "isClosed": False}
+        if opener is not None and not opener.disposed:
+            initializer["opener"] = opener.channel
+        super().__init__(server, context, initializer)
         self.emit("__adopt__", {"guid": self.frame.guid})
         self.frame.parent = self
         # ⛔ AFTER the Page exists: an event that fires during construction
@@ -1807,15 +1829,39 @@ class PageDispatcher(Dispatcher):
         no error at all: the handler simply never runs, and the user concludes
         their page prints nothing.
         """
-        # ⛔ Registered on the connection's list, never chained. The isolation
-        # that used to live in this closure is now `dispatch_event`'s job and
-        # covers every subscriber instead of just this one.
-        self.conn.add_listener(self._route_juggler_event)
+        # The initializer already describes the page's birth. Its first
+        # requests and responses still need delivery, after the channel exists.
+        with self._held_lock:
+            held, self._held = self._held or [], None
+            # Replay is the ordered prefix. A live event can arrive while it
+            # runs, even before the oldest buffered event reaches this page.
+            self._replayed_params = {id(p): p for _, p in self._replayed}
+            held = self._replayed + [
+                (m, p) for m, p in held if id(p) not in self._replayed_params]
+            self._replayed = []
+            last = {id(params): i for i, (_, params) in enumerate(held)}
+            for i, (method, params) in enumerate(held):
+                if last[id(params)] == i and method.startswith("Network."):
+                    self._on_juggler_event(method, params)
 
     def _route_juggler_event(self, method: str, params: Dict,
                              session) -> None:
-        if session == self.session:
+        if session != self.session:
+            return
+        with self._held_lock:
+            if self._held is not None:
+                if len(self._held) >= self.HELD_CAP:
+                    raise ProtocolException("page event buffer overflow during construction")
+                self._held.append((method, params))
+                return
+            # The reader can pause between buffering and delivering an event,
+            # then resume after the entire replay. Keep the bounded replay's
+            # objects alive so id reuse cannot discard a different event.
+            if self._replayed_params.pop(id(params), None) is params:
+                return
             self._on_juggler_event(method, params)
+
+    HELD_CAP = 512
 
     def _detach_listeners(self) -> None:
         """Unsubscribe this page and everything it owns.
@@ -3176,12 +3222,68 @@ class BrowserDispatcher(Dispatcher):
             with self._sessions_ready:
                 self._sessions[info.get("targetId")] = params.get("sessionId")
                 self._sessions_ready.notify_all()
+            if info.get("type") == "page" and info.get("openerId"):
+                # Construction waits for events delivered by this reader.
+                threading.Thread(
+                    target=self._adopt_opened_page,
+                    args=(info, params.get("sessionId")),
+                    name="adopt-%s" % info.get("targetId"), daemon=True).start()
+        elif method == "Browser.detachedFromTarget":
+            with self._sessions_ready:
+                self._sessions.pop(params.get("targetId"), None)
+                page = self._page_for_session(params.get("sessionId"))
+                if page is not None:
+                    self._page_gone(page)
         if session:
             with self._buffer_lock:
                 if session not in self._live:
                     held = self._buffered.setdefault(session, [])
                     if len(held) < self.BUFFER_CAP:
                         held.append((method, params))
+
+    def _context_for(self, context_id: Optional[str]):
+        for context in list(self.contexts):
+            if context.context_id == context_id and not context.disposed:
+                return context
+        return None
+
+    def _page_for_session(self, session: Optional[str]):
+        for context in list(self.contexts):
+            for page in list(context.pages):
+                if page.session == session:
+                    return page
+        return None
+
+    def _adopt_opened_page(self, info: Dict, session: Optional[str]) -> None:
+        context = self._context_for(info.get("browserContextId"))
+        if context is None or not session:
+            if session:
+                self.forget(session)
+            return
+        opener = next((page for page in list(context.pages)
+                       if page.target_id == info.get("openerId")), None)
+        try:
+            page = PageDispatcher(self.server, context, session,
+                                  info.get("targetId"), opener=opener)
+            with self._sessions_ready:
+                if context.disposed:
+                    self.forget(session)
+                    page.announce_closed()
+                    return
+                context.pages.append(page)
+                context.emit("page", {"page": page.channel})
+                if self._sessions.get(info.get("targetId")) != session:
+                    self._page_gone(page)
+        except Exception as error:
+            self.forget(session)
+            if len(self.conn.handler_errors) < 32:
+                self.conn.handler_errors.append("adopt opened page: %s" % error)
+
+    def _page_gone(self, page: "PageDispatcher") -> None:
+        self.forget(page.session)
+        if page in page.context.pages:
+            page.context.pages.remove(page)
+        page.announce_closed()
 
     def replay(self, session: str, deliver) -> int:
         """Hand a new consumer the events of its session that it missed.
