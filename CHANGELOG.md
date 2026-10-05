@@ -6,13 +6,115 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
+### Fork-only
+- **Credential fills retain `expect_origin` and `expect_input_type`.** The
+  permanent #279 guard checks the bound control before and after Firefox's
+  native `Page.setUserInput`, redacts failures, and attempts native clearing
+  when the write outcome is unknown.
+
+### Previous unreleased fork entries
+
+These entries record the fork before upstream integration. The implementations
+are now upstream's, described in the releases below. In particular,
+`service_workers="block"` now refuses instead of installing the old page script;
+the alternative suggested by the old routing error is no longer supported.
+
+#### Added
 - **`page.route()`.** It was refused as an unimplemented gap. A request is
   offered to the page's handlers first and falls through to the context's,
   as in Playwright.
 - **`new_context(service_workers="block")`** blocks service worker
   registration, with the same init script Playwright uses. The option used to
   be accepted and ignored.
+
+#### Fixed
+- **`context.route()` handlers run.** The first request a handler answered
+  was answered on the browser session instead of the page's, the engine
+  refused it, and the page hung on that request.
+- **`route()` refuses, instead of doing nothing, in a browser launched with
+  `dom.serviceWorkers.enabled=false`.** Firefox only offers a request to the
+  interception hook while that pref is true, so a route set as a guard was
+  accepted and saw no request at all while every POST went out. The error
+  names the pref and the alternative, `service_workers="block"`.
+
+## [0.26.0] - 2026-10-05
+
+The firefox-36 engine, pinned through `invisible-core` 36.32.0. The core now
+decides the session language once, and every value this package hands the
+browser reads that decision.
+
+### Changed
+- **The engine is firefox-36**, through `invisible-core` 36.32.0 (the
+  required version is exact, as before).
+- **A session reports one language in every value.** `locale="auto"` and an
+  explicit tag both go through `invisible_core.prepare_session_geo`, the same
+  call that resolves the timezone, and the session keeps its result: the
+  language list Firefox's own table gives that tag. `navigator.language`,
+  `navigator.languages`, the locale prefs, the default context's `locale`,
+  the `Accept-Language` header and the Google CONSENT cookie all read it. A
+  region that has no Firefox build of its own used to report two languages:
+  an Australian egress resolved `en-AU` for the locale prefs and `en-US, en`
+  for the language list, so `navigator.language` said `en-US` while the
+  requested locale said `en-AU`. It now reports `en-US` everywhere, as an
+  English Firefox installed in Australia does. The same holds for the other
+  regions in that position (New Zealand, Ireland, India, Singapore, the
+  Philippines and more).
+- **The default context's `locale` is the decided language, not the tag you
+  passed.** `InvisiblePlaywright(locale="fr-FR")` gives contexts `locale="fr"`,
+  the first entry of the French list (`fr, fr-FR, en-US, en`), which is what
+  `navigator.language` reports. `locale=""` now means en-US explicitly
+  instead of leaving the option out.
+- **The persona cookies (`prep_recaptcha=True`) come from the core**
+  (`invisible_core.persona_cookies`). Same cookies for the same seed; the
+  CONSENT cookie's language now reads the decided language instead of the raw
+  tag, so it can no longer name a language the page does not report.
+
+### Fixed
+- **`new_context(locale=...)` is the context's language.** On firefox-35 a
+  context's locale was ignored and every page reported the launch locale. With
+  firefox-36 `navigator.language`, `navigator.languages`, `Intl` and the
+  `Accept-Language` header of the context's pages follow it, and the server
+  sends the engine the whole language list the tag stands for
+  (`de-DE, de, en-US, en` for `de-DE`, as a German Firefox reports), not the
+  bare tag.
+- **Workers speak their context's language**: dedicated, shared and service
+  workers report the same `navigator.languages` and `Intl` locale as the pages
+  that made them. On firefox-35 they reported the launch locale.
+- **Every request carries the `Accept-Language` a retail Firefox sends.**
+  Firefox-35 sent the raw list (`it-IT, it, en-US, en`) on navigations, fetch
+  and XHR and the q-valued form (`it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7`) only
+  from workers; firefox-36 sends the q-valued form everywhere.
+- **`ignore_https_errors=True` loads a self-signed page.** On firefox-35
+  `new_context` failed with `NS_ERROR_NOT_AVAILABLE`.
+- **A routed request carries its body.** `request.post_data`,
+  `post_data_json` and `post_data_buffer` were None for every POST, in a route
+  handler and on the `request` event alike (feder-cr/invisible_core#90). The
+  body is there whenever a route is set on the page or its context; without a
+  route it stays None, which keeps the engine from copying every POST body.
+- **`go_back()` goes back over a page the script left without a gesture**,
+  like `history.back()`. A page that navigated by `location.href` from a
+  script made `go_back()` return None and stay where it was, because the
+  engine asked the Back button's question (was there a user interaction).
+- **A `window.open` popup with a size keeps that size** instead of taking the
+  tab's viewport.
+
+### Removed
+- `invisible_playwright._recaptcha_seed`, a private module: the cookie data is
+  in the core, and the two call sites hand its list to the context.
+
+### Internal
+- The e2e tests for the engine changes above are plain tests: they fail on
+  firefox-35 and pass on firefox-36. The `ignore_https_errors` test needs
+  `cryptography` for its certificate, now in the `dev` extra.
+- A unit test fails if a locale comparison with "auto", or an import of the
+  core names removed in 36.32.0, comes back into this package.
+
+## [0.25.13] - 2026-10-04
+
+### Added
+- **`page.route()`.** It was refused as an unimplemented gap. A request is
+  offered to the page's handlers first and falls through to the context's,
+  as in Playwright.
 
 ### Fixed
 - **`context.route()` handlers run.** The first request a handler answered
@@ -22,7 +124,84 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `dom.serviceWorkers.enabled=false`.** Firefox only offers a request to the
   interception hook while that pref is true, so a route set as a guard was
   accepted and saw no request at all while every POST went out. The error
-  names the pref and the alternative, `service_workers="block"`.
+  names the pref.
+- **`new_context(service_workers="block")` refuses instead of being
+  ignored.** The option was accepted and nothing read it, so a page's own
+  service worker kept answering requests no route saw. Playwright honours it
+  with a page script whose source names Playwright, which any page can read,
+  so it is refused with a sentence saying why. Routes work with service
+  workers allowed.
+- **A seed replays which tab has which rhythm, with the async API too.**
+  Every page draws its pauses, keys, clicks, drags and cursor paths under its
+  number in the session. The server counted those numbers in the order the
+  engine answered, so `asyncio.gather(browser.new_page(), browser.new_page())`
+  gave the first call number 1 in 4 runs out of 10, and a popup took the next
+  number too, so a `new_page()` gathered with the click that opens one could
+  take the popup's. The cursor counted a third time, at each page's first
+  movement. The client now reserves the number at the call and the server
+  takes it from the request; a popup is numbered from its opener and its rank
+  among that opener's popups, in a space of its own; the cursor reads the
+  page's number from the page. Pages created one after the other keep the
+  numbers they had (0, 1, 2); a `new_page()` after a popup no longer counts
+  the popup, and popups draw new rhythms.
+
+## [0.25.12] - 2026-10-04
+
+### Removed
+- **`invisible_playwright.hesitation()`**, added in 0.25.8. The package adds
+  nothing to Playwright's public contract, and this was the one helper that
+  did. Its only use was the pause before answering a file chooser, which now
+  happens inside the standard methods (see below).
+
+### Changed
+- **`set_input_files`, and so `FileChooser.set_files`, hand the files over
+  after a person's pause to pick them.** With humanising on, the files arrive
+  two of the session's hesitations after the call, finding the file and
+  confirming it, bounded by the action's timeout, instead of a few
+  milliseconds after the chooser opened, which no hand does. With humanising
+  off nothing changes.
+
+## [0.25.11] - 2026-10-04
+
+### Fixed
+- **A page the site opens is a `Page`.** A `window.open()` or a
+  `target=_blank` link opened a tab or a window the client never heard about:
+  no `page` event on the context, no `popup` event on the opener,
+  `expect_page()` and `expect_popup()` timed out, and `context.pages` never
+  listed it. Every page the engine reports is now built on one path, the one
+  `new_page()` uses too, with its opener, so `popup.opener()` answers and the
+  popup is driven like any other page. A popup the site closes with
+  `window.close()` now fires `close` and leaves `context.pages`.
+- **A popup's own document reaches `context.on("request")` and
+  `context.on("response")`**, once each and with its body. It is requested
+  before the popup's page exists, and only its subresources used to arrive;
+  that response is where a PDF opened in a new tab lives.
+
+### Notes
+- A popup opened without a user gesture is still refused by Firefox's popup
+  blocker, as in any Firefox: `page.evaluate("window.open(...)")` returns
+  `null`, because `evaluate` does not carry a user gesture. A real click does.
+
+## [0.25.10] - 2026-10-04
+
+### Fixed
+- **`eval_on_selector` and `eval_on_selector_all` pass `arg` to the expression.**
+  The argument was dropped, so an expression that read it failed with
+  `a is undefined`. The wrapper that turns the caller's expression into a call
+  was written out by hand in four places, which is how two of them came to
+  forget the argument; it is now built in one.
+- **`networkidle` waits for the new document, and reaches every wait that
+  asks for it.** After a `goto`, the old page's silence could satisfy
+  `wait_until="networkidle"` before the new document had loaded. And
+  `wait_for_load_state("networkidle")`, `wait_for_url` and `expect_navigation`
+  with `networkidle` always timed out, because the state was computed inside
+  one wait and never sent to the client. It is now a load state like the
+  others, reached once the current document has loaded and the network has
+  been quiet for half a second, and both `goto` and the client read that one
+  definition.
+- **After a `goto` to a fragment of the same page, `page.url` already has the
+  fragment.** The answer came before the navigation event, so the URL stayed
+  one step behind until the next call.
 
 ## [0.25.9] - 2026-10-03
 

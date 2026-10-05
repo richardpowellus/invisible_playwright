@@ -12,6 +12,11 @@ an error. Two defects stacked:
   instead of the page's, the engine refused the command, and the page hung.
 
 And `page.route` was refused outright as an unimplemented gap.
+
+`new_context(service_workers="block")` was accepted and ignored. Playwright
+honours it with a page script that replaces `navigator.serviceWorker.register`
+with a function whose source names Playwright, which every page can read, so
+here it refuses instead, and the route tests run with service workers allowed.
 """
 from __future__ import annotations
 
@@ -79,17 +84,19 @@ def test_a_route_guard_sees_and_stops_every_post(firefox_binary, where):
     try:
         with InvisiblePlaywright(seed=4243, binary_path=firefox_binary,
                                  headless=True) as browser:
-            context = browser.new_context(service_workers="block")
+            context = browser.new_context()
             page = context.new_page()
             (context if where == "context" else page).route("**/*", guard)
             page.goto(url, wait_until="load", timeout=20_000)
             page.wait_for_function("document.title.startsWith('post:')",
                                    timeout=10_000)
             assert page.title() == "post:blocked", page.title()
-            # the page's own scripts see the init script Playwright installs
+            # routing leaves nothing in the page: the container is the
+            # browser's own, with no property planted on it
             assert page.evaluate(
-                "navigator.serviceWorker.register.toString()"
-                ".includes('blocked by Playwright')")
+                "Object.getOwnPropertyNames(navigator.serviceWorker).length"
+                " === 0 && navigator.serviceWorker.register.toString()"
+                ".includes('[native code]')")
     finally:
         srv.shutdown()
     assert "GET" in routed and routed.count("POST") == 2, routed
@@ -113,3 +120,22 @@ def test_a_route_without_service_workers_refuses_instead_of_ignoring(
         with pytest.raises(Error, match="dom.serviceWorkers.enabled=false"):
             (context if where == "context" else page).route(
                 "**/*", lambda route: route.continue_())
+
+
+@pytest.mark.e2e
+def test_blocking_service_workers_refuses_instead_of_planting_a_page_script(
+        firefox_binary):
+    """Playwright's way to block them is a page-visible override that names
+    Playwright; ignoring the option is a promise nobody keeps. Refusing is
+    the only answer that is true and leaves the page untouched."""
+    from invisible_playwright import InvisiblePlaywright
+    from invisible_playwright.sync_api import Error
+
+    with InvisiblePlaywright(seed=4243, binary_path=firefox_binary,
+                             headless=True) as browser:
+        with pytest.raises(Error, match='service_workers="block" is not '
+                                        'supported'):
+            browser.new_context(service_workers="block")
+        # the browser is still usable after the refusal
+        page = browser.new_context().new_page()
+        assert page.evaluate("1 + 1") == 2

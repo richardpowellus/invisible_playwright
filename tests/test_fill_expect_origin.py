@@ -12,7 +12,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from invisible_playwright._origin import protect_fill_value, validate_expect_origin
-from invisible_playwright._behaviour import SessionActs
+from invisible_playwright._behaviour import PageActs
 from invisible_playwright._juggler.actions import Actions, ElementNotActionable
 from invisible_playwright._juggler.connection import Connection, ProtocolError
 from invisible_playwright._juggler.injected import EvaluationError, InjectedScript
@@ -125,7 +125,7 @@ def _actions(result=None):
     good = {"status": "done", "actualOrigin": ORIGIN}
     inj.call.side_effect = ["control", "snapshot", result or good, good]
     actions = Actions(Mock(), "session", SimpleNamespace(main_frame="frame"), inj,
-                      acts=SessionActs().page())
+                      acts=PageActs())
     actions._center_point = Mock(return_value=(10, 10))
     actions._in_viewport = Mock(return_value=True)
     actions._type = Mock()

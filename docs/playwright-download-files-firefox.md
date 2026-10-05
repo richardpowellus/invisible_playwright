@@ -102,14 +102,14 @@ with InvisiblePlaywright(seed=42) as browser:
 
 ## A document opened in another tab
 
-In this fork, a tab opened by a link or `window.open()` is also a `Page`:
+Since upstream 0.25.11, a tab opened by a link or `window.open()` is also a `Page`:
 `context.pages`, `context.expect_page()` and the opener's `expect_popup()` see it.
 The new page identifies its opener, and a tab the site closes emits `close` and
 leaves `context.pages`.
 
 A PDF displayed in a new tab is not necessarily a download. To observe its
 initial request and response, attach a `context.on("response", ...)` listener
-before triggering the tab. The fork retains those first network events while
+before triggering the tab. The engine retains those first network events while
 constructing the page and delivers them once, in order. Adding a response
 listener to the popup only after it appears can miss its document response.
 

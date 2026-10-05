@@ -1,11 +1,11 @@
 """`goto(..., wait_until="networkidle")` away from a quiet single-page app.
 
-The known-bad input, measured on 2026-10-03 through the MCP server: Amex's
-login page (a single-page app that rewrites its URL with `history.pushState`
-after load) went quiet, and the next `goto` to another site with
+The known-bad input, measured on 2026-10-03: a production login page (a
+single-page app that rewrites its URL with `history.pushState` after load)
+went quiet, and the next `goto` to another site with
 `wait_until="networkidle"` returned at once with NO Response while the browser
-was still on Amex. The server read that None as a same-document navigation and
-said so, naming the old page. The wait had been satisfied by the OLD page's
+was still on the old page. A caller reads that None as a same-document
+navigation. The wait had been satisfied by the OLD page's
 silence before the new document's request was even sent; `wait_until="load"`
 was unaffected.
 

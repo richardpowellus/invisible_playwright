@@ -157,7 +157,8 @@ def test_navigation_updates_url_and_clears_old_load_states(page):
         "commit", "domcontentloaded", "load", "networkidle",
     }
     page.messages.clear()
-    page._on_juggler_event("Page.sameDocumentNavigation", {
+    page._hear_lifecycle()
+    page.lifecycle._on_event("Page.sameDocumentNavigation", {
         "frameId": "widget", "url": "http://localhost/new#hash",
     })
     assert widget.url.endswith("#hash")
@@ -191,3 +192,60 @@ def test_cursor_hit_test_is_the_action_s_own(page, verdict, value):
     answer = handle.call("checkHitTarget", {"point": {"x": 410, "y": 312.5}})
     assert answer == {"value": value}
     page.actions.hit_target.assert_called_once_with("widget", "input", (410.0, 312.5))
+
+
+#: The three element-scoped evaluations and the receiver each one hands to the
+#: caller's function before the argument.
+ELEMENT_CALLBACKS = [
+    ("handle.evaluate", "el"),
+    ("evalOnSelector", "el"),
+    ("evalOnSelectorAll", "els"),
+]
+
+
+@pytest.mark.parametrize("method,receiver", ELEMENT_CALLBACKS,
+                         ids=[m for m, _ in ELEMENT_CALLBACKS])
+def test_every_element_callback_receives_the_caller_s_argument(page, method, receiver):
+    """Playwright's contract is `fn(element, arg)` on all three. The argument
+    used to reach `handle.evaluate` only: `eval_on_selector` and
+    `eval_on_selector_all` called `r(el)` / `r(els)`, so a callback reading its
+    second parameter got `undefined` and threw inside the page.
+
+    Known-bad: drop the argument from any of the three scripts, or build one of
+    them by hand again instead of through the shared builder.
+    """
+    from invisible_playwright._juggler.server import ElementHandleDispatcher
+
+    page.frame.enter_frames = Mock(return_value=("widget", "#target"))
+    page.injected.query_selector.return_value = "node"
+    page.injected.call.return_value = 6
+    params = {"selector": "compound", "expression": "(x, a) => a",
+              "arg": {"value": {"o": [{"k": "n", "v": {"n": 2}}]}, "handles": []}}
+    if method == "handle.evaluate":
+        ElementHandleDispatcher(page.server, page.frame_for("widget"),
+                                "node").call("evaluateExpression", params)
+    else:
+        page.frame.call(method, params)
+    script = page.injected.call.call_args.args[1]
+    assert ("r(%s, {\"n\": 2})" % receiver) in script, script
+
+
+def test_networkidle_reaches_the_client_as_a_load_state(page):
+    """The server's half: the lifecycle's networkidle goes up as
+    `loadstate {"add": "networkidle"}` on the frame, which is the event the
+    client's `wait_for_load_state`, `wait_for_url` and `expect_navigation`
+    wait for. It was never emitted.
+
+    Known-bad: drop the announcement, or emit it from a second reading of the
+    network instead of from the lifecycle.
+    """
+    import time
+
+    from invisible_playwright._juggler.lifecycle import IDLE_QUIET
+
+    page._hear_lifecycle()
+    page.lifecycle._on_event("Page.eventFired", {"frameId": "main", "name": "load"})
+    time.sleep(IDLE_QUIET * 3)
+    added = [m["params"] for m in page.messages
+             if m["guid"] == page.frame.guid and m["method"] == "loadstate"]
+    assert {"add": "networkidle"} in added, added
