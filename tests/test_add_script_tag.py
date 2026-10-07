@@ -2,8 +2,8 @@
 
 The client sends both on the FRAME channel - `page.add_script_tag` is
 `page.main_frame.add_script_tag` - and the server once registered them on the
-Page alone, so every call answered `Frame has no method 'addScriptTag'`
-(bbdtx-accounting run 37309985845, 2026-10-05). These go through the real
+Page alone, so every call answered `Frame has no method 'addScriptTag'`.
+These go through the real
 client API so the channel the call travels on is the one under test.
 """
 from __future__ import annotations
@@ -54,6 +54,15 @@ def test_page_script_tag_content_runs_in_the_main_world(page):
 def test_page_script_tag_url_has_run_when_it_returns(page):
     page.add_script_tag(url="data:text/javascript,window.fromUrl%20%3D%20'loaded'%3B")
     assert page.evaluate("window.fromUrl") == "loaded"
+
+
+@pytest.mark.e2e
+def test_script_tag_type_is_the_callers(page):
+    handle = page.add_script_tag(
+        content="export const x = 1; window.fromModule = import.meta.url;",
+        type="module")
+    assert handle.evaluate("el => el.type") == "module"
+    page.wait_for_function("window.fromModule !== undefined")
 
 
 @pytest.mark.e2e

@@ -1346,7 +1346,7 @@ class FrameDispatcher(Dispatcher):
         `page.add_script_tag` is `page.main_frame.add_script_tag`, so the call
         arrives on the Frame channel. Registered on the Page alone, every
         `add_script_tag` and `add_style_tag` - page or child frame - answered
-        `Frame has no method 'addScriptTag'` (bbdtx-accounting, 2026-10-05).
+        `Frame has no method 'addScriptTag'`.
         """
         url = params.get("url")
         content = params.get("content")
@@ -1358,8 +1358,11 @@ class FrameDispatcher(Dispatcher):
                 "add_%s_tag needs one of url, path or content" % tag)
 
         if tag == "script":
+            # `type` is the caller's: "module" makes the tag an ES module,
+            # which a hardcoded text/javascript would quietly undo.
             build = ("const el = document.createElement('script');"
-                          " el.type = 'text/javascript';")
+                     " el.type = %s;"
+                     % _js_string(params.get("type") or "text/javascript"))
             attribute = "src"
         else:
             build = ("const el = document.createElement('style');"
