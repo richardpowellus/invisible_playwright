@@ -12,10 +12,11 @@ from unittest.mock import Mock, call
 import pytest
 
 from invisible_playwright._origin import protect_fill_value, validate_expect_origin
-from invisible_playwright._behaviour import PageActs
-from invisible_playwright._juggler.actions import Actions, ElementNotActionable
-from invisible_playwright._juggler.connection import Connection, ProtocolError
-from invisible_playwright._juggler.injected import EvaluationError, InjectedScript
+from invisible_core.juggler import PageActs
+from invisible_core.juggler.actions import ElementNotActionable
+from invisible_core.juggler.connection import Connection, ProtocolError
+from invisible_core.juggler.injected import EvaluationError, InjectedScript
+from invisible_playwright._juggler._credential_fill import CredentialActions as Actions
 from invisible_playwright._pw import async_api, sync_api
 
 SECRET = "credential-'\\\n-do-not-print"
@@ -262,6 +263,94 @@ def test_default_fill_keeps_the_existing_call_and_keyboard_sequence():
     ]
     actions._type.assert_called_once_with("ordinary")
     actions.c.send.assert_not_called()
+
+
+@pytest.mark.unit
+def test_ordinary_fill_delegates_to_the_core(monkeypatch):
+    from invisible_core.juggler.actions import Actions as CoreActions
+
+    fill = Mock(return_value="core result")
+    monkeypatch.setattr(CoreActions, "fill", fill)
+    actions, inj = _actions()
+    assert actions.fill("#field", "ordinary", timeout=2, frame_id="child",
+                        element_id="handle", strict=True) == "core result"
+    fill.assert_called_once_with(
+        "#field", "ordinary", timeout=2, frame_id="child",
+        element_id="handle", strict=True)
+    inj.call.assert_not_called()
+
+
+@pytest.mark.unit
+def test_guard_waits_for_resolution_and_actionability(monkeypatch):
+    monkeypatch.setattr("invisible_playwright._juggler._credential_fill.time.sleep", Mock())
+    actions, inj = _actions()
+    inj.query_selector.side_effect = [None, "unready", "resolved"]
+    inj.element_states.side_effect = [
+        {"ok": False, "missing": "editable"}, {"ok": True}]
+    assert actions.fill("#field", SECRET, expect_origin=ORIGIN, strict=True) == "done"
+    assert inj.query_selector.call_args_list == [
+        call("frame", "#field", strict=True)] * 3
+    assert inj.element_states.call_count == 2
+    assert inj.dispose.call_args_list == [
+        call("frame", "unready"), call("frame", "snapshot"),
+        call("frame", "control"), call("frame", "resolved")]
+    assert actions.c.send.call_count == 1
+
+
+@pytest.mark.unit
+def test_guard_retries_detachment_only_during_resolution(monkeypatch):
+    monkeypatch.setattr("invisible_playwright._juggler._credential_fill.time.sleep", Mock())
+    actions, inj = _actions()
+    inj.element_states.side_effect = [
+        EvaluationError("error:notconnected"), {"ok": True}]
+    assert actions.fill("#field", SECRET, expect_origin=ORIGIN) == "done"
+    assert inj.query_selector.call_count == 2
+    assert actions.c.send.call_count == 1
+
+
+@pytest.mark.unit
+def test_guard_never_retries_a_detachment_during_its_precheck():
+    actions, inj = _actions()
+    inj.call.side_effect = ["control", "snapshot", EvaluationError("error:notconnected")]
+    with pytest.raises(EvaluationError, match="nothing was written"):
+        actions.fill("#field", SECRET, expect_origin=ORIGIN)
+    inj.query_selector.assert_called_once()
+    actions.c.send.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["missing", "unready"])
+def test_guard_resolution_timeout_writes_nothing(failure):
+    actions, inj = _actions()
+    if failure == "missing":
+        inj.query_selector.return_value = None
+    else:
+        inj.element_states.return_value = {"ok": False, "missing": "editable"}
+    with pytest.raises(ElementNotActionable, match="nothing was written") as failed:
+        actions.fill("#field", SECRET, expect_origin=ORIGIN, timeout=0)
+    assert SECRET not in str(failed.value)
+    assert "expect_origin=" in str(failed.value)
+    inj.query_selector.assert_called_once()
+    inj.call.assert_not_called()
+    actions.c.send.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("trial", [False, True])
+def test_guard_preserves_the_callers_handle_and_trial(trial):
+    actions, inj = _actions()
+    result = actions.fill("#field", SECRET, expect_origin=ORIGIN,
+                          element_id="handle", trial=trial)
+    assert result == (None if trial else "done")
+    inj.query_selector.assert_not_called()
+    inj.element_states.assert_called_once_with(
+        "frame", "handle", ["visible", "stable", "enabled", "editable"])
+    assert call("frame", "handle") not in inj.dispose.call_args_list
+    if trial:
+        inj.call.assert_not_called()
+        actions.c.send.assert_not_called()
+    else:
+        assert actions.c.send.call_count == 1
 
 
 PAGE = """<!doctype html><meta charset=utf-8>
