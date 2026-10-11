@@ -98,6 +98,12 @@ This is the native path used by Firefox's password manager. An already-focused
 field defers `change` until blur; an unchanged value produces no events.
 Omitting the option keeps ordinary fill behavior.
 
+This is a fork-only API. Since upstream 0.30.0 moved the Juggler client into
+`invisible_core`, the guard lives in `_juggler/_credential_fill.py`, using
+the core's public selector, actionability and utility-world call APIs.
+Only resolution and actionability can retry; a guard refusal or native commit
+attempt never restarts the fill. Ordinary fills still use the core's `Actions`.
+
 **This is not an atomic security boundary.** An ordinary document navigation
 does not replace that document synchronously during one browser task, but the
 checks and commit are separate protocol calls: navigation can occur between
