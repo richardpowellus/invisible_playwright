@@ -1,8 +1,20 @@
-"""Real frame collection and injection, with every external request stubbed.
+"""Real frame collection and injection, with no request leaving loopback.
 
 These fixtures own their fake widget scripts and callbacks. No solving service
 or Google endpoint is contacted, so the integration does not depend on a paid
 account, token lifetime or the public demo's current challenge policy.
+
+⛔ NO REQUEST INTERCEPTION. The pages name Google's script URLs exactly as a
+real site does, and a Content-Security-Policy keeps the browser from fetching
+them: detection reads `script.src`, which a blocked script still carries, and
+the API stub is inlined. The first version fulfilled those URLs with
+`page.route("**/*")` instead, and failed about one run in five with a `goto`
+that never reached load - measured 2026-10-14, the same failure reproduces with
+no reCAPTCHA code at all (a route that only calls `continue_()`, 5 of 60
+navigations: load timeouts and `NS_BINDING_ABORTED` from `continue_`). This
+feature never routes, so its tests do not either. The anchor iframe's URL
+cannot survive the policy (a blocked frame reports an empty URL), so the
+anchor path is covered by tests/test_recaptcha_detect.py.
 """
 from __future__ import annotations
 
@@ -52,8 +64,14 @@ window.grecaptcha = {
 """
 
 
+#: Blocks every load that is not loopback before a request is made.
+CSP = "default-src 'self' 'unsafe-inline'"
+
+
 def _html(body: str, *, fields: bool = True) -> bytes:
-    return (f"<!doctype html><html><head><meta charset='utf-8'></head><body>"
+    return (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f'<meta http-equiv="Content-Security-Policy" content="{CSP}">'
+            f"<script>{API}</script></head><body>"
             f"<script>{SETUP}</script><form onsubmit='window.submitted=true;return false'>"
             f"{FIELDS if fields else ''}{body}<button type='submit'>Submit</button>"
             "</form></body></html>").encode()
@@ -112,9 +130,6 @@ PAGES = {
     "/ambiguous": _html(
         _widget() + '<div data-sitekey="OTHER" data-callback="handlers.done"></div>'),
     "/nested": _html('<iframe src="/checkbox"></iframe>', fields=False),
-    "/anchor-host": _html(
-        '<iframe src="https://www.recaptcha.net/recaptcha/enterprise/anchor?ar=1'
-        f'&amp;k={KEY}&amp;size=invisible&amp;sa=checkout&amp;s=opaque%2Bvalue"></iframe>'),
     "/missing-target": _html(f'<div data-sitekey="{KEY}"></div>', fields=False),
 }
 
@@ -145,17 +160,13 @@ def recaptcha_server():
         thread.join(timeout=5)
 
 
-def _stub(url: str, base: str) -> tuple[str, str] | None:
-    parts = urlsplit(url)
-    if parts.netloc == urlsplit(base).netloc:
-        return None
-    if (parts.hostname in {"www.google.com", "www.recaptcha.net"}
-            and parts.path in {"/recaptcha/api.js", "/recaptcha/enterprise.js"}):
-        return "application/javascript", API
-    if (parts.hostname in {"www.google.com", "www.recaptcha.net"}
-            and parts.path in {"/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor"}):
-        return "text/html", "<!doctype html><html><body>Fixture anchor</body></html>"
-    raise AssertionError("The fixture attempted an unexpected external request")
+def _watch_requests(page, base: str) -> list[str]:
+    """Every URL the page requests that is not the fixture server's."""
+    outside: list[str] = []
+    netloc = urlsplit(base).netloc
+    page.on("request", lambda request: outside.append(request.url)
+            if urlsplit(request.url).netloc != netloc else None)
+    return outside
 
 
 @pytest.fixture
@@ -163,17 +174,9 @@ def recaptcha_page(firefox_binary, recaptcha_server):
     with InvisiblePlaywright(seed=4243, binary_path=firefox_binary,
                              headless=True) as browser:
         page = browser.new_context().new_page()
-
-        def route(request_route):
-            response = _stub(request_route.request.url, recaptcha_server)
-            if response is None:
-                request_route.continue_()
-            else:
-                content_type, body = response
-                request_route.fulfill(status=200, content_type=content_type, body=body)
-
-        page.route("**/*", route)
+        outside = _watch_requests(page, recaptcha_server)
         yield page
+        assert outside == [], "a fixture page reached beyond loopback"
 
 
 class FakeSolver:
@@ -280,21 +283,6 @@ def test_child_widget_stays_in_its_own_document(recaptcha_page, recaptcha_server
     assert page.locator("textarea").count() == 0
 
 
-def test_anchor_evidence_is_injected_into_parent(recaptcha_page, recaptcha_server):
-    page = recaptcha_page
-    page.goto(recaptcha_server + "/anchor-host", wait_until="load")
-    challenge, = detect_recaptcha(page)
-    assert challenge == RecaptchaChallenge(
-        recaptcha_server + "/anchor-host", KEY, "v2-invisible", enterprise=True,
-        action="checkout", data_s="opaque+value", api_domain="www.recaptcha.net",
-        user_agent=page.evaluate("navigator.userAgent"),
-    )
-    result = solve_recaptcha(page, solver=FakeSolver())
-    assert result.fields_filled == 2
-    assert result.callback_called is None
-    assert page.locator("textarea").first.input_value() == TOKEN
-
-
 def test_missing_and_ambiguous_do_not_charge_solver(recaptcha_page, recaptcha_server):
     page, solver = recaptcha_page, FakeSolver()
     page.goto(recaptcha_server + "/empty", wait_until="load")
@@ -353,17 +341,7 @@ def test_async_detect_solve_and_error_parity(firefox_binary, recaptcha_server):
                            headless=True) as browser:
             context = await browser.new_context()
             page = await context.new_page()
-
-            async def route(request_route):
-                response = _stub(request_route.request.url, recaptcha_server)
-                if response is None:
-                    await request_route.continue_()
-                else:
-                    content_type, body = response
-                    await request_route.fulfill(
-                        status=200, content_type=content_type, body=body)
-
-            await page.route("**/*", route)
+            outside = _watch_requests(page, recaptcha_server)
             await page.goto(recaptcha_server + "/v3", wait_until="load")
             challenge, = await detect_recaptcha_async(page)
             assert challenge.kind == "v3"
@@ -390,5 +368,6 @@ def test_async_detect_solve_and_error_parity(firefox_binary, recaptcha_server):
             with pytest.raises(RecaptchaInjectionError) as caught:
                 await solve_recaptcha_async(page, solver=solver)
             assert TOKEN not in str(caught.value)
+            assert outside == []
 
     asyncio.run(run())

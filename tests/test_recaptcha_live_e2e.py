@@ -6,7 +6,7 @@ import os
 import pytest
 
 from invisible_playwright import InvisiblePlaywright
-from invisible_playwright.recaptcha._page import solve_recaptcha
+from invisible_playwright.recaptcha import solve_recaptcha
 
 pytestmark = [
     pytest.mark.e2e,

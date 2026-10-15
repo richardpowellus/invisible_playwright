@@ -8,6 +8,9 @@ The helper finds the widget on the page and its frames, sends it to the
 service, and hands the token to the page the way the page expects. See
 docs/recaptcha-capsolver.md.
 """
+from ._capsolver import CapSolver
+from ._detect import detect_recaptcha, detect_recaptcha_async
+from ._page import solve_recaptcha, solve_recaptcha_async
 from ._types import (
     RecaptchaAmbiguousError,
     RecaptchaChallenge,
@@ -28,6 +31,7 @@ from ._types import (
 )
 
 __all__ = [
+    "CapSolver",
     "RecaptchaAmbiguousError",
     "RecaptchaChallenge",
     "RecaptchaError",
@@ -44,4 +48,8 @@ __all__ = [
     "SolverTimeoutError",
     "SolverUnavailableError",
     "SolverUnsolvableError",
+    "detect_recaptcha",
+    "detect_recaptcha_async",
+    "solve_recaptcha",
+    "solve_recaptcha_async",
 ]
