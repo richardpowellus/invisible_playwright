@@ -79,6 +79,7 @@ def solve_recaptcha(
     solution = _solver(solver, api_key).solve(challenge, timeout=timeout)
     _check_user_agent(challenge, solution)
     injected = _inject_token(widget.frame, sitekey=challenge.sitekey,
+                             time_origin=widget.time_origin,
                              website_url=challenge.website_url,
                              token=solution.token, invoke_callback=invoke_callback)
     return RecaptchaResult(challenge, solution, injected["filled"], injected["callback"])
@@ -98,6 +99,7 @@ async def solve_recaptcha_async(
                                        challenge, timeout=timeout)
     _check_user_agent(challenge, solution)
     injected = await _inject_token_async(widget.frame, sitekey=challenge.sitekey,
+                                         time_origin=widget.time_origin,
                                          website_url=challenge.website_url,
                                          token=solution.token,
                                          invoke_callback=invoke_callback)

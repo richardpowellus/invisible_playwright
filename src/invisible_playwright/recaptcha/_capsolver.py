@@ -78,7 +78,13 @@ class CapSolver:
     """Solve proxyless reCAPTCHA tasks without sending the browser's user agent.
 
     Cookies leave the browser only when the caller supplies ``send_cookies``.
-    The deadline covers creation, retries, polling and all intervening waits.
+    The deadline covers creation, retries, polling and the waits between them;
+    a single HTTP read is bounded by a socket timeout taken from what is left
+    of it, which stops a silent server but not one that keeps trickling bytes.
+
+    A lost reply to ``createTask`` is retried (three attempts at most), and
+    CapSolver may already have accepted - and will charge for - the task whose
+    reply was lost. Only the task whose id came back is polled.
     """
 
     name = "capsolver"
@@ -103,7 +109,9 @@ class CapSolver:
             raise ValueError("poll_interval must not be NaN")
         self._api_key = key
         self.base_url = base_url.rstrip("/")
-        self.poll_interval = min(10.0, max(1.0, float(poll_interval)))
+        # CapSolver: "if processing, wait 3 seconds". Faster polling only burns
+        # the 120 queries a task allows and gives up on a slow one sooner.
+        self.poll_interval = min(10.0, max(3.0, float(poll_interval)))
         self._transport = _post_json if transport is None else transport
         self._sleep = sleep
         self._clock = clock
@@ -165,6 +173,12 @@ class CapSolver:
         except (json.JSONDecodeError, UnicodeError):
             failure = SolverUnavailableError(
                 "CapSolver returned a non-JSON response", provider=self.name,
+            )
+        except ValueError:  # after JSONDecodeError, its subclass
+            # A malformed base_url; urllib's message quotes the URL, which a
+            # caller may have built around the key.
+            failure = SolverRequestError(
+                "CapSolver base_url is not a valid http(s) URL", provider=self.name,
             )
         if failure is not None:
             raise failure from None

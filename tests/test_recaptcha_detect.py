@@ -51,7 +51,7 @@ URL = "https://shop.example/login"
 
 def _empty() -> _Collected:
     return {"widgets": [], "scripts": [], "inline_scripts": [],
-            "clients": [], "user_agent": "Browser UA"}
+            "clients": [], "user_agent": "Browser UA", "time_origin": 1.5}
 
 
 @pytest.mark.parametrize(
@@ -295,18 +295,24 @@ def test_injection_errors_never_expose_page_exceptions_or_empty_tokens():
             raise Error(token)
 
     for call in (
-        lambda: _inject_token(Failing(), sitekey=KEY, website_url=URL,
+        lambda: _inject_token(Failing(), sitekey=KEY, website_url=URL, time_origin=1.5,
                               token=token, invoke_callback=True),
         lambda: asyncio.run(_inject_token_async(
-            AsyncFailing(), sitekey=KEY, website_url=URL, token=token, invoke_callback=True)),
+            AsyncFailing(), sitekey=KEY, website_url=URL, time_origin=1.5, token=token,
+            invoke_callback=True)),
     ):
         with pytest.raises(RecaptchaInjectionError) as caught:
             call()
         assert token not in "".join(traceback.format_exception(caught.value))
+        # `from None` only hides the context from a printed traceback; the
+        # page's error, token and all, must not be reachable on the object.
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
     with pytest.raises(RecaptchaInjectionError, match="empty"):
-        _inject_token(None, sitekey=KEY, website_url=URL, token="", invoke_callback=True)
+        _inject_token(None, sitekey=KEY, website_url=URL, time_origin=1.5, token="",
+                      invoke_callback=True)
     with pytest.raises(RecaptchaInjectionError, match="empty"):
-        asyncio.run(_inject_token_async(None, sitekey=KEY, website_url=URL,
+        asyncio.run(_inject_token_async(None, sitekey=KEY, website_url=URL, time_origin=1.5,
                                         token="", invoke_callback=True))
 
 
@@ -372,3 +378,38 @@ def test_no_script_runs_inside_recaptchas_own_frames():
     [challenge] = detect_recaptcha(page)
     assert [f.reads for f in page.frames] == [1, 0, 0]
     assert (challenge.kind, challenge.action) == ("v2-invisible", "submit")
+
+
+def test_the_public_demo_page_is_read_like_any_site():
+    """Only reCAPTCHA's anchor and bframe are skipped, not every /recaptcha/ page.
+
+    Google's demo lives at /recaptcha/api2/demo; skipping that prefix whole
+    left the live test's own page unread.
+    """
+    from invisible_playwright.recaptcha._detect import _is_google_frame
+    assert not _is_google_frame("https://www.google.com/recaptcha/api2/demo")
+    for doc in ("api2/anchor", "api2/bframe", "enterprise/anchor", "enterprise/bframe"):
+        assert _is_google_frame(f"https://www.google.com/recaptcha/{doc}?k={KEY}")
+        assert _is_google_frame(f"https://www.recaptcha.net/recaptcha/{doc}?k={KEY}")
+
+
+def test_script_text_alone_is_not_a_widget():
+    """A commented-out execute must not cost a paid task, or make a page ambiguous."""
+    [dead] = _parse_inline_scripts(["/* grecaptcha.execute('OLD', {action: 'login'}); */"])
+    assert _merge_facts([dead], website_url=URL, user_agent=None) == []
+    live = _parse_script_src(f"https://www.google.com/recaptcha/api.js?render={KEY}")
+    [hint] = _parse_inline_scripts([f"grecaptcha.execute('{KEY}', {{action: 'login'}})"])
+    [challenge] = _merge_facts([dead, live, hint], website_url=URL, user_agent=None)
+    assert (challenge.sitekey, challenge.kind, challenge.action) == (KEY, "v3", "login")
+
+
+def test_a_widgets_anchor_outranks_a_script_the_page_shares():
+    """enterprise.js?render=explicit and a standard anchor: the anchor decides."""
+    shared = _parse_script_src(
+        "https://www.recaptcha.net/recaptcha/enterprise.js?render=explicit")
+    anchor = _parse_anchor_url(
+        f"https://www.google.com/recaptcha/api2/anchor?ar=1&k={KEY}&size=normal&s=opaque")
+    [challenge] = _merge_facts([shared, anchor], website_url=URL, user_agent=None)
+    assert challenge.enterprise is False
+    assert challenge.api_domain is None
+    assert challenge.data_s == "opaque"

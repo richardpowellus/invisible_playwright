@@ -335,6 +335,24 @@ def test_navigation_during_solving_does_not_disclose_token_to_new_page(
     assert page.evaluate("window.received") == []
 
 
+def test_a_reload_during_solving_does_not_receive_the_token(
+    recaptcha_page, recaptcha_server,
+):
+    """Same URL, new document: the token was solved for the old one."""
+    page = recaptcha_page
+    page.goto(recaptcha_server + "/checkbox", wait_until="load")
+
+    class ReloadingSolver(FakeSolver):
+        def solve(self, challenge, *, timeout):
+            page.reload(wait_until="load")
+            return super().solve(challenge, timeout=timeout)
+
+    with pytest.raises(RecaptchaInjectionError):
+        solve_recaptcha(page, solver=ReloadingSolver())
+    assert page.locator("textarea").first.input_value() == ""
+    assert page.evaluate("window.received") == []
+
+
 def test_async_detect_solve_and_error_parity(firefox_binary, recaptcha_server):
     async def run():
         async with AsyncIP(seed=4243, binary_path=firefox_binary,

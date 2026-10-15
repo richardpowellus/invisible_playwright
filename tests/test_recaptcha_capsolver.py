@@ -312,17 +312,20 @@ def test_no_more_than_120_result_queries(response):
 
 
 def test_the_120th_query_can_still_succeed():
-    solver, transport, clock = solver_for(
-        CREATED, *[{"status": "processing"}] * 119, READY, poll_interval=1,
-    )
+    # A non-advancing clock: at the documented 3 s floor, 120 queries take
+    # 360 s, past the 300 s a task lives, so only the query budget is tested.
+    transport = Transport(CREATED, *[{"status": "processing"}] * 119, READY)
+    sleeps = []
+    solver = CapSolver(KEY, transport=transport, clock=lambda: 100.0,
+                       sleep=sleeps.append)
     assert solver.solve(CHALLENGE, timeout=300).token == TOKEN
     assert len(transport.calls) == 121
-    assert clock.now == 220
+    assert sleeps == [3.0] * 120
 
 
 @pytest.mark.parametrize("interval,expected", [
-    (-2, 1), (0, 1), (0.5, 1), (1, 1), (3, 3), (10, 10), (100, 10),
-    (float("inf"), 10), (-float("inf"), 1),
+    (-2, 3), (0, 3), (0.5, 3), (1, 3), (3, 3), (5, 5), (10, 10), (100, 10),
+    (float("inf"), 10), (-float("inf"), 3),
 ])
 def test_poll_interval_is_clamped(interval, expected):
     solver, _, clock = solver_for(CREATED, READY, poll_interval=interval)
@@ -652,3 +655,11 @@ def test_real_urllib_transport_over_loopback(caplog, monkeypatch):
         server.server_close()
         thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+def test_a_malformed_base_url_never_quotes_the_key():
+    solver = CapSolver(KEY, base_url=f"gateway.example/{KEY}")
+    with pytest.raises(SolverRequestError) as caught:
+        solver.balance()
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert KEY not in rendered and KEY not in repr(caught.value.__context__)

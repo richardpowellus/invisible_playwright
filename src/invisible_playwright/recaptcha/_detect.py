@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Generic, TypedDict, TypeVar
 from urllib.parse import parse_qs, urlsplit
 
@@ -47,6 +47,9 @@ class _Collected(TypedDict):
     inline_scripts: list[str]
     clients: list[_Client]
     user_agent: str
+    #: `performance.timeOrigin`: set once per document, so injection can tell
+    #: the document it detected from a reload at the same URL.
+    time_origin: float
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,9 @@ class _Facts:
     data_s: str | None = None
     api_domain: str | None = None
     callback: str | None = None
+    #: Where the fact came from. An anchor URL is Google's own statement about
+    #: one widget; inline script text is a hint that proves nothing on its own.
+    source: str = field(default="page", compare=False)
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,7 @@ class _Snapshot(Generic[_FrameT]):
 class _Detected(Generic[_FrameT]):
     challenge: RecaptchaChallenge
     frame: _FrameT
+    time_origin: float | None = None
 
 
 # Shared with injection so the callback's discovery and resolution cannot
@@ -140,7 +147,8 @@ _COLLECT_JS = r"""() => {
     return {
         widgets, scripts, inline_scripts,
         clients: (__CLIENTS__)(),
-        user_agent: navigator.userAgent
+        user_agent: navigator.userAgent,
+        time_origin: performance.timeOrigin
     };
 }""".replace("__CLIENTS__", _CLIENTS_JS)
 
@@ -190,6 +198,7 @@ def _parse_anchor_url(url: str) -> _Facts | None:
         action=_query_value(params, "sa"),
         data_s=_query_value(params, "s"),
         api_domain=host if host.endswith("recaptcha.net") else None,
+        source="anchor",
     )
 
 
@@ -231,6 +240,7 @@ def _parse_inline_scripts(scripts: list[str]) -> list[_Facts]:
                 enterprise=bool(match["enterprise"]),
                 action=options.get("action"),
                 callback=options.get("callback") if not execute else None,
+                source="inline",
             ))
         if remaining <= 0:
             break
@@ -281,16 +291,26 @@ def _merge_facts(facts: list[_Facts], *, website_url: str,
             grouped.setdefault(fact.sitekey, []).append(fact)
     challenges = []
     for key, specific in grouped.items():
+        # Text in a script (possibly a comment, possibly dead code) is not a
+        # widget. Charging a paid task for it needs something live as well.
+        if all(fact.source == "inline" for fact in specific):
+            continue
         sources = common + specific
         kinds = {fact.kind for fact in sources}
+        # The anchor is Google's own description of THIS widget. A script shared
+        # by the page (an enterprise.js?render=explicit, a recaptcha.net copy)
+        # must not override it for a widget whose anchor says otherwise.
+        anchor = next((fact for fact in reversed(specific) if fact.source == "anchor"), None)
         challenges.append(RecaptchaChallenge(
             website_url=website_url, sitekey=key,
             kind="v3" if "v3" in kinds else
                  "v2-invisible" if "v2-invisible" in kinds else "v2",
-            enterprise=any(fact.enterprise for fact in sources),
+            enterprise=(anchor.enterprise if anchor is not None
+                        else any(fact.enterprise for fact in sources)),
             action=_last([fact.action for fact in sources]),
             data_s=_last([fact.data_s for fact in sources]),
-            api_domain=_last([fact.api_domain for fact in sources]),
+            api_domain=(anchor.api_domain if anchor is not None
+                        else _last([fact.api_domain for fact in sources])),
             callback=_last([fact.callback for fact in sources]),
             user_agent=user_agent,
         ))
@@ -318,10 +338,18 @@ def _assemble(snapshots: list[_Snapshot[_FrameT]]) -> list[_Detected[_FrameT]]:
         if _parse_anchor_url(item.url):
             continue
         ua = user_agent or (item.data["user_agent"] if item.data else None)
-        found.extend(_Detected(challenge, item.frame) for challenge in
+        origin = item.data["time_origin"] if item.data else None
+        found.extend(_Detected(challenge, item.frame, origin) for challenge in
                      _merge_facts(facts[id(item.frame)], website_url=item.url,
                                   user_agent=ua))
     return found
+
+
+#: reCAPTCHA's own widget documents: the checkbox (anchor) and the challenge
+#: (bframe). Named exactly, because Google serves customer-facing pages under
+#: the same prefix - the public demo is /recaptcha/api2/demo.
+_GOOGLE_FRAMES = {f"/recaptcha/{api}/{doc}" for api in ("api2", "enterprise")
+                  for doc in ("anchor", "bframe")}
 
 
 def _is_google_frame(url: str) -> bool:
@@ -332,7 +360,7 @@ def _is_google_frame(url: str) -> bool:
     evaluated inside them: the scan reads them by URL only.
     """
     parsed = _recaptcha_url(url)
-    return parsed is not None and parsed[1].startswith("/recaptcha/")
+    return parsed is not None and parsed[1] in _GOOGLE_FRAMES
 
 
 def _detect_widgets(page: Page) -> list[_Detected[Frame]]:

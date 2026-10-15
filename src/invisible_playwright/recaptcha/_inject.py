@@ -27,8 +27,10 @@ class _InjectionResult(TypedDict):
 
 # One action for both APIs: fill all response fields, then call one callback.
 # Resolve names as properties, never eval: a callback name is data, not code.
-_INJECT_JS = r"""({token, sitekey, websiteURL, invokeCallback}) => {
-    if (window.location.href !== websiteURL)
+_INJECT_JS = r"""({token, sitekey, websiteURL, timeOrigin, invokeCallback}) => {
+    // The URL alone misses a reload of the same address; `timeOrigin` is set
+    // once per document, so a replacement document never matches it.
+    if (window.location.href !== websiteURL || performance.timeOrigin !== timeOrigin)
         throw new Error('The reCAPTCHA document navigated during solving');
     const fields = document.querySelectorAll(
         'textarea[name="g-recaptcha-response"], [id^="g-recaptcha-response"]'
@@ -85,32 +87,42 @@ def _check_injection(result: _InjectionResult) -> _InjectionResult:
     return result
 
 
-def _inject_token(frame: Frame, *, sitekey: str, website_url: str, token: str,
-                  invoke_callback: bool) -> _InjectionResult:
+_REFUSED = "The reCAPTCHA frame could not accept the response token"
+
+
+def _inject_token(frame: Frame, *, sitekey: str, website_url: str, time_origin: float,
+                  token: str, invoke_callback: bool) -> _InjectionResult:
     if not token:
         raise RecaptchaInjectionError("The solver returned an empty response token")
+    result = None
     try:
         result = frame.evaluate(_INJECT_JS, {
             "token": token, "sitekey": sitekey, "invokeCallback": invoke_callback,
-            "websiteURL": website_url,
+            "websiteURL": website_url, "timeOrigin": time_origin,
         })
     except Error:
-        # A site's callback can throw the token itself. Do not chain that error.
-        raise RecaptchaInjectionError(
-            "The reCAPTCHA frame could not accept the response token") from None
+        # A site's callback can throw the token itself. The refusal is raised
+        # OUTSIDE the handler: `from None` hides `__context__` from a printed
+        # traceback but still keeps it, token and all, on the exception.
+        pass
+    if result is None:
+        raise RecaptchaInjectionError(_REFUSED)
     return _check_injection(result)
 
 
-async def _inject_token_async(frame: AsyncFrame, *, sitekey: str, website_url: str, token: str,
+async def _inject_token_async(frame: AsyncFrame, *, sitekey: str, website_url: str,
+                              time_origin: float, token: str,
                               invoke_callback: bool) -> _InjectionResult:
     if not token:
         raise RecaptchaInjectionError("The solver returned an empty response token")
+    result = None
     try:
         result = await frame.evaluate(_INJECT_JS, {
             "token": token, "sitekey": sitekey, "invokeCallback": invoke_callback,
-            "websiteURL": website_url,
+            "websiteURL": website_url, "timeOrigin": time_origin,
         })
     except Error:
-        raise RecaptchaInjectionError(
-            "The reCAPTCHA frame could not accept the response token") from None
+        pass  # raised below, outside the handler; see _inject_token
+    if result is None:
+        raise RecaptchaInjectionError(_REFUSED)
     return _check_injection(result)

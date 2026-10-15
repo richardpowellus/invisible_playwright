@@ -60,13 +60,21 @@ to check the key works before a run.
    `ReCaptchaV2EnterpriseTaskProxyLess`, `ReCaptchaV3TaskProxyLess` or
    `ReCaptchaV3EnterpriseTaskProxyLess`, with `pageAction`, `isInvisible`,
    `enterprisePayload` / `recaptchaDataSValue` and `apiDomain` only when the page
-   supplied them. It then polls `getTaskResult` at a bounded interval (3 s by
-   default, within CapSolver's 120 queries and 5 minutes per task) until the token
-   is ready or `timeout` passes.
+   supplied them. It then polls `getTaskResult` every 3 to 10 seconds (CapSolver
+   asks for 3 between queries, and allows 120 queries and 5 minutes per task)
+   until the token is ready or `timeout` passes.
 3. **Hands the token over**: writes it into every `g-recaptcha-response` field of
    the widget's frame and, unless `invoke_callback=False`, calls the widget's
    `data-callback` or the callback the page registered with `grecaptcha.render`,
    exactly as Google's script would after a solve.
+
+A widget is only sent for solving when the page has it live: a `data-sitekey`
+element, a `render=` script, a registered client or an anchor frame. A
+`grecaptcha.execute(...)` that appears only as script text (it may be a comment)
+adds the action to a live widget but never creates one, so it cannot cost a
+task. Before the token is written, the helper checks the frame still holds the
+same document it detected; a navigation or a reload during the solve raises
+`RecaptchaInjectionError` instead of handing the token to the new page.
 
 It does not submit the form. Submitting is a click, and clicks in this library go
 through the real pointer.
@@ -104,7 +112,8 @@ site that binds a token tightly to the browser's user agent may still refuse it.
 
 ## Errors
 
-Everything raised is a `RecaptchaError`:
+Everything raised once the call starts is a `RecaptchaError` (an out-of-range
+`timeout` is a `ValueError`, before anything is detected or paid for):
 
 | Error | When |
 |---|---|
@@ -118,8 +127,16 @@ Everything raised is a `RecaptchaError`:
 | `SolverUnavailableError` | CapSolver unreachable or rate limiting, after retries |
 | `SolverTimeoutError` | `timeout` passed before a token was ready |
 
-Every `SolverError` carries the service's own code in `.code`, for example
-`ERROR_ZERO_BALANCE`.
+A `SolverError` that CapSolver itself reported carries CapSolver's code in
+`.code`, for example `ERROR_ZERO_BALANCE`; a missing key, a network failure or
+our own timeout has `.code` set to `None`.
+
+### What a call costs
+
+One solve is one CapSolver task, charged by CapSolver. When the reply to
+`createTask` is lost in transit the call retries, at most three attempts, and
+CapSolver may already have accepted (and will charge for) the task whose reply
+was lost: a call costs one task in the usual case and at most three.
 
 ## Another solving service
 
@@ -134,7 +151,7 @@ and its error codes onto the classes above.
 The CapSolver client is tested against a mocked HTTP API, and detection against
 local pages for each widget type, with no request leaving the machine. One live
 test runs against Google's demo page and checks Google accepts the token; it is
-skipped unless `CAPSOLVER_API_KEY` is set, and it spends one solve:
+skipped unless `CAPSOLVER_API_KEY` is set, and each run is a paid CapSolver task:
 
 ```bash
 CAPSOLVER_API_KEY=... pytest -m e2e tests/test_recaptcha_live_e2e.py
