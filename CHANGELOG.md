@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
+### Fork-only
 - **`solve_recaptcha(page)` gets a flow past a reCAPTCHA with CapSolver.** It finds
   the widget on the page and its frames (v2 checkbox, invisible v2, v3, Enterprise,
   scripts served from `www.recaptcha.net`, the v3 action and the `s` payload where
@@ -18,6 +18,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The solver is an interface, so another service is one new class.
   `solve_recaptcha_async` and `detect_recaptcha` come with it; the guide is
   `docs/recaptcha-capsolver.md`.
+- **Credential fills retain `expect_origin` and `expect_input_type`.** The
+  permanent #279 guard checks the bound control before and after Firefox's
+  native `Page.setUserInput`, redacts failures, and attempts native clearing
+  when the write outcome is unknown.
+  On upstream 0.30.0 and later, `_juggler/_credential_fill.py` adds this path
+  using the core's public utility-world APIs; ordinary actions remain in
+  `invisible_core.juggler`. No core module is copied back into this package.
+
+### Previous unreleased fork entries
+
+These entries record the fork before upstream integration. The implementations
+are now upstream's, described in the releases below. In particular,
+since 0.28.0, `service_workers="block"` uses the engine's per-context
+`Browser.setServiceWorkersBlocked` command, without a page script or a global
+preference change, and routing remains enabled.
+
+#### Added
+- **`page.route()`.** It was refused as an unimplemented gap. A request is
+  offered to the page's handlers first and falls through to the context's,
+  as in Playwright.
+- **`new_context(service_workers="block")`** blocks service worker
+  registration, with the same init script Playwright uses. The option used to
+  be accepted and ignored.
+
+#### Fixed
+- **`context.route()` handlers run.** The first request a handler answered
+  was answered on the browser session instead of the page's, the engine
+  refused it, and the page hung on that request.
+- **`route()` refuses, instead of doing nothing, in a browser launched with
+  `dom.serviceWorkers.enabled=false`.** Firefox only offers a request to the
+  interception hook while that pref is true, so a route set as a guard was
+  accepted and saw no request at all while every POST went out. The error
+  names the pref and the alternative, `service_workers="block"`.
 
 ## [0.32.0] - 2026-10-10
 

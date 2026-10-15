@@ -5,6 +5,7 @@ dist/
 build/
 .pytest_cache/
 .venv/
+.venv-test/
 firefox-source/
 
 # Third-party source trees kept on disk for on-demand compatibility audits.

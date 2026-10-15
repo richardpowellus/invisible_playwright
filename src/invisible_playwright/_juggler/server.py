@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional
 
 from invisible_core.juggler import PageActs, popup_number
 from invisible_core.juggler import connection as juggler
-from invisible_core.juggler.actions import Actions
+from ._credential_fill import CredentialActions as Actions
 from .dispatcher import Dispatcher, ProtocolException, Server
 from invisible_core.juggler.injected import InjectedScript
 from invisible_core.juggler.keyboard import MODIFIER_MASK
@@ -603,7 +603,10 @@ class ElementHandleDispatcher(Dispatcher):
         return None
 
     def op_fill(self, params: Dict) -> Any:
-        self.frame.actions.fill(_HANDLE, params["value"], **self._act_args(params))
+        self.frame.actions.fill(_HANDLE, params["value"],
+                                expect_origin=params.get("expect_origin"),
+                                expect_input_type=params.get("expect_input_type"),
+                                **self._act_args(params))
         return None
 
     def op_type(self, params: Dict) -> Any:
@@ -1013,6 +1016,8 @@ class FrameDispatcher(Dispatcher):
         frame_id, selector = self.enter_frames(params["selector"])
         self.actions.fill(selector, params["value"],
                                timeout=self._timeout(params), frame_id=frame_id,
+                               expect_origin=params.get("expect_origin"),
+                               expect_input_type=params.get("expect_input_type"),
                                **self._act_opts(params))
         return None
 
@@ -4259,7 +4264,6 @@ class JugglerServer(Server):
                          "utils": utils.channel},
             guid="Playwright")
         return {"playwright": playwright.channel}
-
 
 
 
