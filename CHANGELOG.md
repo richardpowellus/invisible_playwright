@@ -15,6 +15,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   using the core's public utility-world APIs; ordinary actions remain in
   `invisible_core.juggler`. No core module is copied back into this package.
 
+### Fixed
+- **Answering a route whose request a navigation already aborted no longer
+  raises into the caller's next call.** With `page.route("**/*", lambda r:
+  r.continue_())`, each `goto` aborted the previous document's favicon while
+  its route was still being continued; the engine answered
+  `NS_BINDING_ABORTED`, and the error came out of the next `goto` or
+  `evaluate`, or that `goto` timed out waiting for load: 4-12 of every 60
+  sequential routed gotos on a loopback page. `continue_`, `fulfill` and
+  `abort` now treat a request that is gone as answered, as Playwright's own
+  Firefox server does (`sendMayFail`).
+
 ### Previous unreleased fork entries
 
 These entries record the fork before upstream integration. The implementations
