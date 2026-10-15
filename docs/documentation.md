@@ -12,7 +12,9 @@ gets the wrapper and the engine on disk, [Quickstart](quickstart.md) is the two-
 switch from plain Playwright, [Configuration](configuration.md) covers proxies,
 timezone and environment variables, [Pinning fingerprint fields](pinning.md) covers
 forcing specific values while leaving the rest seed-derived, and the
-[CLI reference](cli-reference.md) covers the command line.
+[CLI reference](cli-reference.md) covers the command line, and
+[Solving reCAPTCHA with CapSolver](recaptcha-capsolver.md) covers getting a flow
+past a reCAPTCHA with a paid solving service.
 
 If you're here to understand *why* a particular signal matters rather than how to
 configure this package, that's [Guides](guides.md) instead.

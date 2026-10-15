@@ -6,7 +6,7 @@
 
 The helper finds the widget on the page and its frames, sends it to the
 service, and hands the token to the page the way the page expects. See
-docs/solve-recaptcha-capsolver.md.
+docs/recaptcha-capsolver.md.
 """
 from ._types import (
     RecaptchaAmbiguousError,
