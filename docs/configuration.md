@@ -77,6 +77,7 @@ row is for a specific situation.
 | `INVISIBLE_PLAYWRIGHT_SKEW=allow` | Run a Playwright version outside the tested range anyway |
 | `INVPW_CURSOR_ENGINE` | `python` (default), `binary`, or `off` |
 | `INVISIBLE_DOWNLOAD_DEADLINE` | Seconds allowed for one engine download, default `1800`. Raise it on a very slow link; `0` removes the bound |
+| `CAPSOLVER_API_KEY` | The CapSolver key `solve_recaptcha` uses when none is passed; see [Solving reCAPTCHA with CapSolver](recaptcha-capsolver.md) |
 
 ```bash
 export INVISIBLE_PLAYWRIGHT_CACHE_DIR=/mnt/big/engines

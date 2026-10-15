@@ -148,6 +148,26 @@ not carry raises, and the error lists the ones it does.
 
 Full list of pinnable keys, how pinning interacts with the Bayesian sampler, and common patterns are in **[docs/pinning.md](docs/pinning.md)**.
 
+### reCAPTCHA through CapSolver
+
+When a flow has to get past a reCAPTCHA, `solve_recaptcha` finds the widget (v2
+checkbox, invisible v2, v3, Enterprise) on the page and its frames, has
+sends it to [CapSolver](https://www.capsolver.com/), and hands the token to the page the
+way Google's own script would: the `g-recaptcha-response` fields, then the widget's
+callback. Each call is a paid CapSolver task; the key comes from `CAPSOLVER_API_KEY`.
+
+```python
+from invisible_playwright.recaptcha import solve_recaptcha
+
+page.goto("https://www.google.com/recaptcha/api2/demo")
+solve_recaptcha(page)                            # or: await solve_recaptcha_async(page)
+page.locator("#recaptcha-demo-submit").click()   # submitting stays a real click
+```
+
+Writing the token is the one script action it takes. How widgets are found, the errors,
+and the interface for adding another service are in
+**[docs/recaptcha-capsolver.md](docs/recaptcha-capsolver.md)**.
+
 ---
 
 ## CLI

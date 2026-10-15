@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Fork-only
+- **`solve_recaptcha(page)` gets a flow past a reCAPTCHA with CapSolver.** It finds
+  the widget on the page and its frames (v2 checkbox, invisible v2, v3, Enterprise,
+  scripts served from `www.recaptcha.net`, the v3 action and the `s` payload where
+  the page carries them), sends a task to CapSolver's documented API, polls within a
+  bounded interval and a timeout, and writes the token into the
+  `g-recaptcha-response` fields before calling the widget's callback. The form is
+  left for a real click. Errors are typed (`SolverAuthError`, `SolverBalanceError`,
+  `SolverTimeoutError`, ...), and neither the API key nor a full token is logged.
+  The solver is an interface, so another service is one new class.
+  `solve_recaptcha_async` and `detect_recaptcha` come with it; the guide is
+  `docs/recaptcha-capsolver.md`.
 - **Credential fills retain `expect_origin` and `expect_input_type`.** The
   permanent #279 guard checks the bound control before and after Firefox's
   native `Page.setUserInput`, redacts failures, and attempts native clearing
