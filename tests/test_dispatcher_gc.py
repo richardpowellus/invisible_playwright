@@ -268,3 +268,34 @@ def test_routed_requests_leave_no_frames_behind(firefox_binary, echo_server):
     assert frame_infos < 50, (
         "200 routed requests left %d FrameInfo objects alive; each holds a "
         "frame and its locals" % frame_infos)
+
+
+@pytest.mark.unit
+def test_the_network_cap_can_be_lowered_for_requests_and_responses(monkeypatch):
+    """A host with little memory sets one variable; handles keep their cap."""
+    monkeypatch.setenv("INVISIBLE_PLAYWRIGHT_NETWORK_GC_LIMIT", "100")
+    server, _ = _server(monkeypatch, 10000)
+    page = _Root(server, None)
+    requests = [_Leaf(server, page) for _ in range(1000)]
+
+    assert sum(not r.disposed for r in requests) <= 100
+    assert server._gc_limits["Response"] == 100
+    assert server._gc_limits["JSHandle"] == 100000
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw", ["0", "99", "-5", "lots", "1e3"])
+def test_a_network_cap_that_cannot_be_honoured_is_refused(monkeypatch, raw):
+    """⛔ Ignoring a bad value would leave the host on the default it set the
+    variable to escape, with nothing to say so until it swaps."""
+    monkeypatch.setenv("INVISIBLE_PLAYWRIGHT_NETWORK_GC_LIMIT", raw)
+    with pytest.raises(ValueError, match="INVISIBLE_PLAYWRIGHT_NETWORK_GC_LIMIT"):
+        Server()
+
+
+@pytest.mark.unit
+def test_without_the_variable_the_drivers_numbers_apply(monkeypatch):
+    monkeypatch.delenv("INVISIBLE_PLAYWRIGHT_NETWORK_GC_LIMIT", raising=False)
+    server = Server()
+    assert "Request" not in server._gc_limits
+    assert server._gc_limits["ElementHandle"] == 100000
