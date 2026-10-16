@@ -32,6 +32,7 @@ be, and the failure surfaces later, in a property access far from the cause.
 from __future__ import annotations
 
 import itertools
+import os
 import threading
 from typing import Any, Callable, Dict, Optional
 
@@ -162,11 +163,42 @@ class Dispatcher:
         return getattr(self, name)(params)
 
 
+#: Overrides the cap for Request and Response only, for a host that keeps a
+#: browser busy for hours and has the memory of a small box. See `GC_LIMITS`.
+NETWORK_GC_LIMIT_ENV = "INVISIBLE_PLAYWRIGHT_NETWORK_GC_LIMIT"
+#: Below this the oldest tenth is a handful of objects, and a page that loads a
+#: few dozen subresources at once could have one collected before it is read.
+NETWORK_GC_LIMIT_MIN = 100
+
+
+def _gc_limits(defaults: Dict[str, int]) -> Dict[str, int]:
+    """The per-TYPE caps, with the network override applied.
+
+    ⛔ A value that cannot be honoured is refused, not ignored. Ignoring it
+    would leave the host on the default it set the variable to escape - an
+    unbounded-looking 10,000 per type - with nothing to say so until it swaps.
+    """
+    limits = dict(defaults)
+    raw = os.environ.get(NETWORK_GC_LIMIT_ENV, "").strip()
+    if not raw:
+        return limits
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < NETWORK_GC_LIMIT_MIN:
+        raise ValueError("%s must be a whole number of at least %d, not %r"
+                         % (NETWORK_GC_LIMIT_ENV, NETWORK_GC_LIMIT_MIN, raw))
+    limits["Request"] = limits["Response"] = value
+    return limits
+
+
 class Server:
     """The guid registry, and the entry point the transport calls."""
 
     def __init__(self) -> None:
         self._objects: Dict[str, Dispatcher] = {}
+        self._gc_limits = _gc_limits(self.GC_LIMITS)
         #: parent guid -> {child guid: child}, so a dispose touches its own
         #: subtree and nothing else. See `descendants_of`.
         self._children: Dict[str, Dict[str, Dispatcher]] = {}
@@ -270,7 +302,7 @@ class Server:
             self._children.setdefault(self._parent_guid(obj), {})[obj.guid] = obj
             bucket = self._buckets.setdefault(obj.TYPE, {})
             bucket[obj.guid] = obj
-            limit = self.GC_LIMITS.get(obj.TYPE, self.GC_DEFAULT_LIMIT)
+            limit = self._gc_limits.get(obj.TYPE, self.GC_DEFAULT_LIMIT)
             if len(bucket) > limit:
                 # The oldest tenth, skipping what may not be collected yet: a
                 # request still in flight is named by events still to come.

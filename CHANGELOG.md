@@ -26,6 +26,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   using the core's public utility-world APIs; ordinary actions remain in
   `invisible_core.juggler`. No core module is copied back into this package.
 
+### Added
+- **`INVISIBLE_PLAYWRIGHT_NETWORK_GC_LIMIT` lowers the Request/Response cap.**
+  By default a browser keeps 10,000 live Requests and 10,000 Responses, the
+  driver's own number, which is about 800 MB for a page posting 20 KB bodies
+  twenty times a second. A host that keeps one browser busy for hours can set
+  this to as little as 100; handles keep their 100,000. A Request or Response
+  older than the cap raises "The object has been collected" when used, and a
+  request still in flight is never collected. A value below 100 or not a whole
+  number refuses to start the browser rather than being ignored.
+
 ### Fixed
 - **A finished task is no longer kept alive by a future it raced.** On Python
   3.14 `asyncio.wait` records the waiting task in every future's awaited-by set
