@@ -29,8 +29,11 @@ from invisible_core.juggler._behaviour import (
     PageActs, TypingPersona, plan_hesitation, plan_typing,
 )
 from invisible_core.juggler import actions as actions_mod
+from invisible_core.juggler import deadline as deadline_mod
 from invisible_core.juggler.actions import Actions
 from invisible_core.juggler.keyboard import Keyboard
+
+from _servers import LocalServer
 
 MAIN = "frame-main"
 SEED = 4242
@@ -155,6 +158,8 @@ class _Lifecycle:
 def clock(monkeypatch):
     c = _Clock()
     monkeypatch.setattr(actions_mod, "time", c)
+    # The action's deadline reads the clock in its own module.
+    monkeypatch.setattr(deadline_mod, "time", c)
     return c
 
 
@@ -308,7 +313,7 @@ def store_url():
         def log_message(self, *a):
             pass
 
-    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    srv = LocalServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield "http://127.0.0.1:%d/?answer=%d" % (srv.server_port, ANSWER_MS)
     srv.shutdown()

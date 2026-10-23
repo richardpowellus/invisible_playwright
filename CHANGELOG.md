@@ -99,6 +99,583 @@ preference change, and routing remains enabled.
   accepted and saw no request at all while every POST went out. The error
   names the pref and the alternative, `service_workers="block"`.
 
+## [0.41.0] - 2026-10-21
+
+The pin moves to invisible-core 51.48.0, which brings the firefox-51 engine.
+
+### Changed
+- invisible-core 50.48.0 -> 51.48.0, sealed to the firefox-51 engine (Firefox
+  151.0). The canvas noise now spares two-colour blends (`edge_tolerance`
+  replaces `edge_step` in the core).
+
+### Added
+- `font.system_text_quality` is documented on the pinning page. It was already
+  pinnable (0 none, 4 standard antialiasing, 5 ClearType; default 5) and
+  documented nowhere.
+
+## [0.40.0] - 2026-10-19
+
+The pin moves to invisible-core 50.48.0, on the same firefox-50 engine.
+
+### Fixed
+- **`expect()` works for every condition, not two families.** The server
+  re-wrote Playwright's assertions in Python one condition at a time and had
+  written `to_have_count` and the `to_be_*` states; `to_have_text`,
+  `to_contain_text`, `to_have_value`, `to_have_values`, `to_have_attribute`,
+  `to_have_class`, `to_contain_class`, `to_have_css`, `to_have_id`,
+  `to_have_js_property`, `to_be_focused`, `to_be_empty`, `to_be_in_viewport`,
+  `to_have_title`, `to_have_url` and the accessibility ones answered "is not
+  implemented yet". Each reading is now Playwright's own `expect`, from the
+  injected script this package already ships, called the way Playwright's
+  server calls it: strict mode, `element(s) not found`, and a JavaScript error
+  that ends the wait with its message. On Playwright's own suite, its expect
+  tests on firefox-49 went from 30 of 94 passing to 75, with none lost.
+- `to_have_js_property` with an object, an array or a date as the expected
+  value is refused by name: the page's value lives in another realm, and
+  comparing it would always report a difference. Primitives are compared.
+  `to_match_aria_snapshot` is refused by name too: its template is YAML that
+  Playwright's server parses, and this one has no parser for it.
+- A failed `expect` reports an object as the object. The client read the value
+  the server sent twice, the second time as if it were still in its wire form,
+  so `{"a": 1}` failed with `KeyError: 'id'` instead of the assertion's message,
+  and `{"v": "x"}` or `{"n": 5}` were reported as `x` and `5`. The vendored
+  client had the two reads from Playwright 1.61.0, which still has them; the
+  second one is gone.
+- A failed `expect` prints its call log, as Playwright's does: the assertion
+  and its timeout (`Expect "to_be_visible" with timeout 5000ms`), what it
+  waited for (`waiting for locator("#a1")`), and what each reading found
+  (`locator resolved to <input/>`, `unexpected value "Go"`). The message said
+  what was expected and what was seen, and nothing of the wait in between.
+- `page.goto` follows the context's `base_url`. The server never read it, so
+  `goto("/empty.html")` in a context created with a base failed with
+  "Invalid url /empty.html"; it now navigates to the base's `/empty.html`, as
+  Playwright does. The address is resolved by the engine's own URL parser,
+  the one that then navigates to it.
+- `page.evaluate`, `evaluate_handle`, `wait_for_function` and the
+  element-scoped evaluations run the caller's text as a script, as Playwright
+  does. The server put it inside an expression so that it could call the
+  result in the same pass, so a statement with its semicolon,
+  `setTimeout(() => {...}, 2000);`, died with "missing ) in parenthetical".
+  The text is now evaluated on its own and a function it produces is called
+  with the argument, and the page sees the caller's code without anything
+  around it. `wait_for_function` evaluates a function predicate once per
+  document and calls it on every turn, as Playwright's poll does.
+
+### Changed
+- **The user-install job runs on the ledger pull request**, not on
+  `release: published`, which never fired: the Release is created with
+  GITHUB_TOKEN, and an event that token causes starts no other workflow.
+  CI checks the wiring with `python -m invisible_core.install_job`.
+- The release tests keep out of the venvs they build every variable the
+  core's library reads, as `invisible_core.install_job.LEAKS` lists them: an
+  engine folder, a seal file or a GitHub token in the caller's shell no
+  longer changes what they measure.
+- The publish workflow checks the version and the ledger against the index
+  before it uploads (`invisible_core.release check --verify-index`), as the
+  pre-push hook does: a clone without the hook can no longer skip it.
+- **The vendored client's README says what actually differs from upstream.**
+  `_pw/README.md` named `_impl/_driver.py`, a file removed with the Node driver,
+  as the only changed file, while eight files carry the
+  `# MODIFIED by invisible_playwright` marker; it now lists them, in English.
+- **`_pw/` is no longer excluded from the English gate.** The upstream code is
+  English already, so the folder exclusion only hid our own text: the README
+  and the error raised for `chromium` and `webkit`, now in English.
+- `THIRD_PARTY_FORK.md` gives the vendored client's version as 1.61.0, which is
+  what `_pw/_repo_version.py` and the development pin say.
+
+## [0.39.0] - 2026-10-18
+
+The pin moves to invisible-core 50.47.0, on the firefox-50 engine. From
+firefox-50 every realm, worker and worklet takes the session's zone from the
+engine's own override, so the launch no longer writes `TZ` into the browser's
+environment. On Windows no `TZ` could satisfy both the C runtime and ICU, so
+some zones showed the machine's time inside a Worker, and zones outside a
+ten-row table were never covered; that is gone with it.
+
+### Changed
+- The IANA-to-POSIX conversion is no longer imported or used. Code that took
+  `IANA_TO_POSIX_TZ` from the core has to stop: the core 50.47.0 removes it.
+
+## [0.38.0] - 2026-10-18
+
+The pin moves to invisible-core 49.46.0. The desktop settings a page can read -
+scrollbars, text scale, drag threshold, double-click selection, the system
+colours in both schemes, the refresh rate, the form-control font and more -
+are declared by the persona instead of read from the machine it runs on, and
+each of them can be pinned ([pinning](docs/pinning.md)).
+
+### Changed
+- **The way in is uv.** The README installs with one complete block per
+  system: uv from its own installer, `uv init --python ">=3.11" my-project`,
+  `uv add invisible-playwright`, `uv run invisible-playwright fetch`.
+  CONTRIBUTING, the guides and the issue template teach the same, and CI
+  refuses an install instruction that is not uv
+  (`python -m invisible_core.way_in`, core 49.45.0).
+- **A remedy this package prints is the command for your environment.** In a
+  venv uv made, which has no pip, a broken install was told to run
+  `pip install --force-reinstall invisible-playwright`; it is now told the uv
+  command, and an environment pip made is still told pip, through its own
+  interpreter.
+
+### Fixed
+- The Docker guide's base image has a Python older than this package needs,
+  and the arm64 guide's Debian image an externally managed one, so neither
+  install line could work: uv now brings the interpreter. The installation
+  guide no longer lists macOS, which has had no engine since 2026-08-26.
+
+## [0.37.0] - 2026-10-17
+
+The pin moves to invisible-core 49.44.0, on the firefox-49 engine.
+
+### Changed
+- **Your code runs in a world of its own, where a page that replaced a
+  standard API cannot count your calls.** `evaluate`, `evaluate_handle`,
+  `wait_for_function`, `eval_on_selector(_all)`, `locator.evaluate`,
+  `handle.evaluate` and `set_content` ran in the page's own realm, so a
+  call to `document.querySelector` went through whatever the page had
+  put in its place: a Cloudflare challenge wraps it, and one lookup of
+  its token field from an evaluate got the clearance refused. They now
+  run in a world with the page's principal where a name the standard
+  defines is the native one, and every other name is the page's:
+  `window.__NEXT_DATA__`, a node's `__vue__` and the page's functions
+  answer as before.
+  On what the page created (its classes, their instances, its plain objects)
+  the page's definitions win, `toString` and `valueOf` included, and an
+  object your code hands to the page keeps its identity and looks to the
+  page like its own (`instanceof Array` holds, its `constructor` is the
+  page's). What changes, and it is declared rather than accidental: a name
+  the standard defines for one of the browser's own objects wins even where
+  the page redefined it on that object itself (a setter the page put on one
+  input's `value` does not run; `.wrappedJSObject` gives the page's own
+  view); a bare assignment to an undeclared name creates a global of your
+  world, not of the page (`window.x = 1` still reaches the page); and your
+  code's own `eval` is not governed by the page's Content-Security-Policy,
+  which governs the page's (`window.eval`) as before. Needs firefox-49.
+- **`request.post_data` holds the body with no route as well.** Until
+  firefox-48 the engine read a request's body only while a route was set, so
+  every POST of a page with no route answered `None`, like a form sent empty.
+  It now reads every body up to 10 MB, as Playwright's does, and the upload
+  reaches the site whole. Needs firefox-49.
+- **`response.security_details()` names the certificate, and
+  `response.from_service_worker` says when a service worker answered.**
+  The engine reported neither (`None` and `False` for every response); it now
+  reports both as Playwright's does. Needs firefox-49.
+
+### Fixed
+- **`eval_on_selector`, `eval_on_selector_all`, `locator.evaluate` and
+  `handle.evaluate` see what the page put on an element.** They ran
+  behind the automation's own view, where `el.__vue__` and the methods
+  of a custom element's class do not exist.
+- **The browser's favicon request no longer reaches the client.** A
+  `page.route("**/*")` handler saw `GET /favicon.ico` now and then, as did the
+  `request`, `response` and `requestfinished` listeners, and a
+  `route.fallback(post_data=...)` rewrote it too. As in Playwright, the favicon,
+  and a request it redirects to, now sends no event, reaches no route handler
+  and is not a request `networkidle` waits on. Unlike Playwright it is not
+  aborted under a route: it goes to the site, as from any Firefox.
+- **A request held after interception was switched off no longer stalls the
+  session.** Its release was sent from the thread that delivers the engine's
+  events and waited for a reply only that thread could read; the next command
+  of the page then waited forever.
+- **`route.abort()` with no error code fails the request with
+  `NS_ERROR_FAILURE`, as in Playwright on Firefox.** It failed with
+  `NS_ERROR_ABORT`, the code of `route.abort("aborted")`.
+- **A route that sends a navigation to another URL lands there.**
+  `route.fallback(url=...)` or `route.continue_(url=...)` on a document
+  request made `goto` fail with "reported committed on ..., which is not where
+  it went", and the response kept the URL the request was sent with. The
+  response is now the routed URL's, and `goto` lands on it.
+
+## [0.36.2] - 2026-10-17
+
+The pin moves to invisible-core 48.43.0, still on the firefox-48 engine.
+
+### Fixed
+- **`response.security_details()` hands on the certificate the engine sent.**
+  It answered `None` for every response, HTTPS included, which a script reads
+  as "not over TLS". The response now keeps what the engine reported; an
+  engine that reports nothing (firefox-48 and earlier) still answers `None`.
+- **The e2e tests that measure time run alone.** Eight of them assert an
+  upper bound on a wall-clock duration, and beside four browsers the device
+  enumeration one went red on a rerun-clean SHA three times. They carry the
+  new `wall_clock` marker, and the core's e2e run gives them the machine alone
+  after the parallel tests.
+
+## [0.36.1] - 2026-10-16
+
+The pin moves to invisible-core 48.42.0, on the same firefox-48 engine.
+
+### Fixed
+- **`wait_for_function` ends when the predicate returns an element.**
+  `wait_for_function("() => document.querySelector('#x')")` timed out although
+  the element existed: the predicate ran by value and the result was judged
+  after serialization, where a node is nothing truthy. It is now judged as
+  JavaScript judges it, from one run of the predicate, and the element is the
+  handle the wait returns.
+- **A handle from `evaluate_handle` can be used.** Its `text_content`,
+  `evaluate` and `json_value` all failed with "Cannot find object": the value
+  was made in the page's own world and the handle looked for it in the
+  automation's. A node is now carried into the automation's world, as the
+  handles of `add_script_tag` already were, and any other value's handle
+  runs its operations where the value lives. The same goes for the handle
+  `wait_for_function` returns.
+- **A GeoIP database being downloaded is never read half-written.** Two
+  sessions starting together on a cold cache could have one open the database
+  while the other was still writing it, and fail with "Is this a valid MaxMind
+  DB file?". The core now extracts it outside the cache, checks it with the
+  real reader and moves it into place in one step (invisible-core 48.42.0).
+
+## [0.36.0] - 2026-10-16
+
+The pin moves to invisible-core 48.41.0, on the firefox-48 engine. 0.35.11 was
+never published: its fix is listed here.
+
+### Added
+- **The branding a page reads is a profile field.** `pin={"branding": ...}`
+  takes `"official"` (the default, the retail Firefox's files), `"unofficial"`,
+  or the absolute path of a zip archive of your own with the same 16 files at
+  its root. The engine serves the declared files at `chrome://branding/content/`
+  and `resource://usercontext-content/branding/` instead of its own, from inside
+  the archive as Firefox serves its own branding. Needs firefox-48.
+
+### Changed
+- **The speechSynthesis voices follow the session's language.** An it-IT session
+  lists the voices of a Windows with Italian added instead of only the American
+  ones; a language without a measured set keeps the English one, and a
+  `hardware.voices` pin still wins.
+
+### Fixed
+- **A persistent profile stays the same machine across launches.** With
+  `profile_dir` and no `seed`, every launch used to draw a new seed, so the same
+  profile came back with another GPU, screen and fonts. The first launch now
+  records its seed in the profile and later ones reuse it; an explicit `seed`
+  that differs from the recorded one is refused.
+- **Opening and closing pages quickly no longer breaks `new_page()`.** A page's
+  close and the delivery of its events ran on two threads with nothing between
+  them, so an event of a page being closed could create a response under a
+  request the client had already dropped, and the client raised
+  `'dict' object has no attribute '_object'`, from `new_page()` or from a
+  `response` listener: 3 to 5 failed cycles out of 150 in every run of four.
+  A page's events now go through one gate under its close's lock, and do
+  nothing once it is closed: 0 out of 600.
+
+## [0.35.10] - 2026-10-15
+
+The pin moves to invisible-core 47.41.0, on the same firefox-47 engine.
+
+### Added
+- **The engine can live on a read-only disk.** `INVISIBLE_PLAYWRIGHT_ENGINE_DIR`
+  puts the sealed engine trees somewhere of their own, written only by a
+  download; `INVISIBLE_PLAYWRIGHT_CACHE_DIR` keeps the machine's writable state
+  (the GeoIP database, the font manifest). Unset, nothing moves. A launch on an
+  engine already fetched by the same core writes nothing into the store.
+
+### Changed
+- **`timezone="auto"` that cannot be resolved now fails the launch without a
+  proxy too.** It used to fall back to the host's timezone in silence when the
+  exit could not be discovered or the GeoIP database could not be obtained,
+  which on a server kept in UTC gives a timezone that contradicts its own IP.
+  The error names the cause; pass an explicit IANA zone to launch offline.
+
+## [0.35.9] - 2026-10-15
+
+The pin moves to invisible-core 47.40.0, on the same firefox-47 engine.
+
+### Fixed
+- **Closing a browser no longer closes the pipe of another browser in the
+  same process.** The driver closes a browser's pipe from `Browser.close` and
+  again when the session shuts down, and each call closed the pipe's
+  descriptor numbers. A released number goes to the next pipe the process
+  opens, so when one process drove several sessions the second call closed
+  another browser's pipe: its launch died with `EISDIR`, or it stopped
+  answering. The connection now releases each end once and never touches
+  the number again.
+
+## [0.35.8] - 2026-10-14
+
+The pin moves to invisible-core 47.39.0, which seals the firefox-47 engine.
+
+### Fixed
+- **A page can no longer tell that the engine carries the automation protocol
+  (#336).** Every engine until firefox-47 registered the protocol as a chrome
+  package named `juggler`, and a page tells a registered package from an absent
+  one with one line, `new Worker("chrome://juggler/...")`: it returns on our
+  engine and throws `SecurityError` on Firefox. Captcha vendors started probing
+  it in October 2026, which is why a challenge solved by hand was still refused.
+  firefox-47 loads the protocol from `resource://gre/modules/juggler/`, a
+  namespace every Firefox has and inside which a page cannot tell which files
+  exist; the engine now registers exactly the chrome packages and resource
+  substitutions Firefox 151 does, and its release is refused if it registers
+  any name that Firefox does not.
+- **A goto the page stops on its way no longer answers OK on the old page, nor
+  waits out its timeout.** `document.open()` and `window.stop()` in the page
+  being left stop the navigation on its way, and the engine dropped every such
+  stop of the main frame (a workaround meant for the spurious one a Fission
+  process swap fires): `goto` answered OK while the page was still the
+  previous one, or waited for its timeout. It now raises `NS_BINDING_ABORTED`
+  at once, as Playwright does on Firefox. Every way a page or the caller can
+  stop or replace a goto (document.open, window.stop, location.replace and
+  assign, a form submit, an iframe navigating the top, history.back,
+  pushState, a meta refresh, a second goto) is tested against upstream
+  Playwright's answers, in one process and across a process swap.
+- **`goto` refuses a success the engine made up**: when the commit attributed
+  to its navigation is not where that navigation's request went (redirects
+  included), it raises "Navigation to ... was reported committed on ..., which
+  is not where it went" instead of answering OK.
+- **A goto that the caller's next goto stops** says "is interrupted by another
+  navigation to" the new address, as upstream; it said `NS_BINDING_ABORTED`.
+- **`goto(until="load")` counts only its own document's `load`**: the states
+  were cleared when a navigation started, not when it committed.
+- **A goto that waited out its timeout no longer says "the current navigation
+  is nav-N, not our nav-N"**: it says that our navigation started and neither
+  committed nor was aborted.
+- **The wheel is born before the page sees it**, as keys and mouse moves are
+  since 0.35.7: `event.timeStamp` was the instant the wheel reached the page,
+  0 to 2 ms below `performance.now()` in the handler where a real wheel is 6
+  to 14, and half of the wheel events failed the filter a tracker applies.
+
+## [0.35.7] - 2026-10-13
+
+The pin moves to invisible-core 45.39.0, which seals the firefox-45 engine.
+
+### Fixed
+- **A key or a mouse move is born before the page sees it**, as on a real
+  machine, where the system takes a few milliseconds between the hardware and
+  the page's handler. The engine stamped every input event at the instant it
+  reached the page, so `event.timeStamp` equalled `performance.now()` there,
+  and a script that keeps only the events with `timeStamp < performance.now()`
+  dropped most of our keys (`page.type`, `keyboard`, `mouse`). Each event is now born a few milliseconds earlier,
+  drawn per event from the session (a median of 6 to 11 ms, fixed by the
+  seed): measured in the handler, 4 to 22 ms.
+- **The first `navigator.mediaDevices.enumerateDevices()` of a session takes
+  the same time on Windows and on Linux**, a time the seed fixes between 240
+  and 640 ms. It took the host's audio stack time, 15 to 40 ms on Linux and
+  about 300 ms on Windows, so a script that sends its payload before the list
+  arrives saw a device field on one build and not on the other. With fake
+  devices the browser no longer asks the host for its speakers; the list a
+  page sees is unchanged.
+
+## [0.35.6] - 2026-10-13
+
+The pin moves to invisible-core 44.39.0, which seals the firefox-44 engine.
+
+### Fixed
+- **Stopping a screencast no longer freezes the browser on Windows.** The
+  engine stopped its window capture on the thread that owns the window, while
+  the capture was waiting for that thread to draw the window for it; when a
+  stop landed during a capture, the browser answered nothing more. Measured
+  with one browser on the hidden desktop: frozen within the first ten stops
+  on the engines before firefox-44.
+- **Text with a character the US layout has no key for is typed**:
+  `page.type("#i", "café")`, `locator.type(...)` and `keyboard.type(...)`
+  raised "'é' has no key on the US layout". The keys that exist are
+  pressed and the character is inserted in its place, as Playwright does.
+- **On Linux, the line endings a page reads are Windows'**: a `Blob` or a
+  `File` made with `endings: "native"` turns `\n` into `\r\n`, and the text
+  of a selection across two blocks is joined by `\r\n`, as on Windows.
+- **`speechSynthesis.getVoices()` is Windows' list**: David, Mark, Zira and
+  the two Desktop voices, in that order, and none of them is the default.
+  David was the default and Zira came before Mark.
+
+## [0.35.5] - 2026-10-13
+
+The pin moves to invisible-core 43.39.0, which seals the firefox-43 engine.
+
+### Fixed
+- **A page's frames stay in `page.frames` after a few navigations in one
+  tab.** The engine reported the iframes of the page being loaded as
+  detached while it loaded them, once the back-forward cache let an older
+  page of the tab go: `page.frames` missed them and a `frame_locator` into
+  them waited until its timeout. Measured with five pages in a row: none of
+  the three frames of the fifth before, all three now.
+- **On Linux, AAC is answered as on Windows.** `canPlayType` and
+  `MediaSource.isTypeSupported` of `audio/mp4`, `audio/aac`, `audio/x-m4a`
+  and `video/mp4; codecs="mp4a.40.2"` answered "maybe" at first and then
+  nothing from about 300 ms on, on a host without its own AAC decoder, while
+  H.264 stayed "probably": no Windows Firefox answers that. They now answer
+  what Windows does, "maybe", "maybe", "maybe" and "probably", with
+  MediaSource true, false, false, true. A Linux host without an AAC decoder
+  still cannot play the audio.
+
+## [0.35.4] - 2026-10-13
+
+The pin moves to invisible-core 42.39.0, which seals the firefox-42 engine.
+
+### Fixed
+- **A page that replaces itself no longer loses its main world.** Now and
+  then, after a page that navigated or reloaded itself, the new document's
+  main world was never announced, and a read in the page's world waited 30
+  seconds and failed: the engine's channel answered the new page's first
+  requests with the answers an earlier page had been given.
+- **A session keeps the focus when another one starts beside it.** With two
+  sessions on one desktop, the first lost the focus when the second opened its
+  window: its page got `blur`, `document.hasFocus()` turned false and a focused
+  field stopped taking keys. Measured on Windows, two sessions on one hidden
+  desktop: 4 first sessions in 6 lost it before, 0 in 6 now.
+- **The real mouse no longer turns a click into a drag.** In a visible
+  session, the person's cursor moving over the window during a click could
+  start a native drag on a link, and the click failed with an error from
+  `dispatchDragEvent`.
+- **`evaluate` of a function that rejects with something that is not an
+  `Error`** (a plain object, an `Event`) raises, as in Playwright; it answered
+  `None`.
+
+## [0.35.3] - 2026-10-13
+
+The pin moves to invisible-core 41.39.0.
+
+### Fixed
+- **`go_back()` and `go_forward()` to a same-document entry (a hash, a
+  `pushState`) answer `None` at once**, as Playwright's. They waited for a
+  navigation id that a same-document navigation never has, and raised
+  `TimeoutError` at the timeout (measured on 0.35.2: 8 s for
+  `go_back(timeout=8000)`).
+- A protocol command inside an action waits for what is left of the action's
+  timeout and no longer has a 10 s bound of its own (invisible-core 41.39.0),
+  so an action on a loaded host does not fail before its timeout; a key or a
+  pointer event waits for the engine's answer, which the engine bounds itself.
+
+## [0.35.2] - 2026-10-12
+
+The pin moves to invisible-core 41.38.0.
+
+### Added
+- **`page.evaluate_read(expression, arg=None)`**, not in Playwright: `evaluate`
+  for a read that has no effect on the page, which the caller declares. When
+  the page navigates under it, it is made again on the page that replaced it
+  and answers from there, where `evaluate` raises. Never pass it code with an
+  effect: it may run in both documents.
+
+### Fixed
+- **The caller's code runs once when its page navigates while it waits.** A
+  script passed to `page.evaluate`, `evaluate_handle` or
+  `eval_on_selector_all` that was waiting on a promise when its page navigated
+  was sent again into the page that replaced it, so a script with an effect
+  ran twice (since 0.35.0). It now raises "Execution context was destroyed,
+  most likely because of a navigation", as Playwright does, and is never sent
+  again. `wait_for_function` keeps polling on the new page. The library's own
+  reads are not the caller's code and still answer with the page that replaced
+  the one they went to: `count`, `inner_text`, `text_content`, and now
+  `all_inner_texts` and `all_text_contents` too, which no longer travel as an
+  `eval_on_selector_all`.
+
+## [0.35.1] - 2026-10-12
+
+The pin moves to invisible-core 41.37.0.
+
+### Fixed
+- **A browser that dies ends every wait at once.** A wait for an event - a
+  page's load state, its main frame, a navigation - had nothing to wake it when
+  the browser closed or crashed, so it ran to its timeout, and with no timeout
+  (`timeout=0`) it never ended. It now raises at once that the target closed.
+
+## [0.35.0] - 2026-10-12
+
+The pin moves to invisible-core 41.36.0.
+
+### Fixed
+- **A page that replaces itself right after it loads no longer breaks the
+  next call.** On a page that calls `location.replace` from its `<head>` or
+  just after `load` (a JavaScript challenge, a consent redirect), a read made
+  right after `goto` failed with the engine's raw "Failed to find execution
+  context", and `goto(..., wait_until="networkidle")` timed out; on a loaded
+  machine `domcontentloaded` did too. Both now answer on the page that took
+  its place.
+- **A `goto` the browser abandons answers at once.** Sent while the previous
+  page's own redirect was in flight, a `goto` could lose to it: Firefox loads
+  the redirect and drops ours without a word, and the call waited for its
+  whole timeout. It now raises at once with Playwright's own `Navigation to
+  "X" is interrupted by another navigation to "Y"`, as upstream Playwright
+  does on Firefox, and the page is on `Y`.
+- **`page.frames` lists the frames the page has.** After a navigation that
+  moved the page to another browser process it kept the old document's
+  iframes and listed the main frame again, one more each time.
+- **Reads wait for the element, as in Playwright.** `inner_text`,
+  `text_content`, `inner_html`, `input_value`, `get_attribute`, `is_enabled`,
+  `is_checked` and the other selector reads failed at once with "no element
+  matches" instead of waiting up to their `timeout`; `is_visible` and
+  `is_hidden` raised on a missing element instead of answering `False` and
+  `True`.
+- **`expect(locator)` works.** Every `to_be_*` and `to_have_count` failed with
+  an empty AssertionError whatever the page held; they now wait for the
+  condition within their timeout, `not_to_*` included. `to_be_empty`,
+  `to_be_focused` and `to_be_in_viewport` say they are not implemented
+  instead of passing.
+
+## [0.34.0] - 2026-10-11
+
+The pin moves to invisible-core 41.35.0, which seals the firefox-41 engine.
+
+### Fixed
+- **`bypass_csp=True` lifts the page's Content-Security-Policy.** The option
+  reached the browser and changed nothing it enforced: inline scripts, `eval`
+  and `add_script_tag` stayed blocked (#295). With firefox-41 the page's header
+  and `<meta>` policies are not applied when the option is on, and are applied
+  exactly as before when it is off.
+- **A screencast keeps the rate it was asked for.** Below 4 frames a second it
+  delivered about twice what was requested: asking for 2 gave 4. It now gives
+  about 2.
+- **On Linux a window covered by another one is not reported as hidden**, the
+  same as on Windows. Pages in a visible session covered by a second session's
+  window read `document.visibilityState === "hidden"` and had their timers and
+  animation frames throttled.
+- **A launch that fails before the browser starts stops the hidden display.**
+  With `headless=True`, a launch that failed while composing the prefs, the
+  proxy or the environment (a proxy scheme the engine cannot express, a font
+  manifest it does not carry) left the hidden display running: an Xvfb process
+  on Linux, a desktop handle on Windows. A retry loop around the launch
+  collected one per attempt (#326, by RayenMlayeh).
+- **A launch gets the whole timeout the caller gave it.** `launch(timeout=)`
+  bounded only the wait for the browser to start; the proxy command and the
+  last startup step after it had 10 and 30 seconds of their own. On a loaded
+  machine the proxy command could go unanswered for 10 seconds and the launch
+  failed with "the engine refused the proxy" while its 60 seconds still had
+  time. One deadline now covers the whole startup, a launch past it raises
+  `TimeoutError` instead of claiming a refusal, and `timeout=0` means no
+  limit, as in Playwright, where it used to mean 60 seconds.
+- **`timeout=0` means no limit.** An action, a wait or a navigation given
+  `timeout=0` gave up after 30 seconds; as in Playwright, it now waits as long
+  as it takes.
+- **A timeout is a `TimeoutError`.** A click on an element that never became
+  actionable, or a `wait_for_function` that never became true, raised a plain
+  `Error`, so `except TimeoutError` around them caught nothing. They raise
+  `TimeoutError` now, as in Playwright.
+- **No fixed bound on calls Playwright gives none.** Creating a context and
+  applying its options, cookies, permissions, geolocation, closing a page or a
+  context, and page commands such as `set_viewport_size` or `bring_to_front`
+  each had 10 or 30 seconds of their own. They wait for the browser's answer,
+  and still end at once if the browser is gone; `screenshot` takes its own
+  `timeout`.
+
+## [0.33.1] - 2026-10-11
+
+### Fixed
+- **A new page waits for the browser as long as the caller does.** Opening a
+  page gave the browser a fixed 30 seconds to answer, shorter than the caller's
+  own bound: on a loaded machine, right after a slow launch, the first page of
+  a session (and so the first navigation of an MCP session) failed at 31
+  seconds and worked when repeated (#321). The wait now ends when the browser
+  answers or when it is gone.
+- **A request's `resource_type` says what it is.** Juggler sends a request's
+  `cause` as an `nsIContentPolicy` constant name (`TYPE_DOCUMENT`,
+  `TYPE_XMLHTTPREQUEST`, `TYPE_FETCH`), and the table it was looked up in was
+  keyed by `document`, `xmlhttprequest`, `fetch`, so nothing matched and every
+  request reported `other`. The lookup now uses the Playwright driver's own
+  table, `internalCause` first so an EventSource reports `eventsource`
+  (#305, by richardpowellus).
+
+## [0.33.0] - 2026-10-11
+
+### Fixed
+- **The shutdown pings leave by the session's proxy.** At the end of a session
+  longer than a minute, Firefox posts its shutdown telemetry from a separate
+  process. That process took its network settings from the machine, so a
+  session behind a SOCKS5 or HTTP proxy sent those pings from the machine's own
+  address. With the firefox-40 engine (invisible-core 40.35.0) they go through
+  the same proxy as the session, or directly when the session has none, and the
+  session waits for them to finish before it removes its files: closing a long
+  session takes about a second more.
+
 ## [0.32.0] - 2026-10-10
 
 ### Fixed

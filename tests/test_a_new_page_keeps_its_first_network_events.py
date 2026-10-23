@@ -23,6 +23,10 @@ def _page(held):
     page.session = "S1"
     page._held = list(held)
     page._held_lock = threading.Lock()
+    # `_deliver` (upstream 0.41) hands each event over under the close's lock
+    # and drops it once the page is announced closed.
+    page._close_lock = threading.RLock()
+    page._announced_closed = False
     page.lifecycle = SimpleNamespace(announce=None)
     page.got = []
     page._on_juggler_event = lambda m, p: page.got.append((m, p["n"]))

@@ -57,9 +57,20 @@ from invisible_playwright._pw._impl._transport import Transport
 def _error_payload(failure: BaseException) -> Dict[str, str]:
     """The `{name, message, stack}` shape both an error REPLY and a
     directly-translated exception are built from - one function, so the two
-    do not drift the way rule 16 forbids."""
+    do not drift the way rule 16 forbids.
+
+    ⛔ EVERY TimeoutError IS NAMED "TimeoutError", whatever its subclass. The
+    client picks its class by that exact name (`parse_error`), and the name
+    used to be the subclass's own: a click whose element never became
+    actionable raised the core's `ElementNotActionable`, and the caller got a
+    plain Error where Playwright raises TimeoutError, so `except TimeoutError`
+    around a click caught nothing (found 2026-10-11 with the launch timeout,
+    which is the core's `ReplyTimeout`). The subclass is still in the stack."""
+    name = type(failure).__name__
+    if isinstance(failure, TimeoutError):
+        name = "TimeoutError"
     return {
-        "name": type(failure).__name__,
+        "name": name,
         "message": str(failure) or type(failure).__name__,
         "stack": "".join(traceback.format_exception(
             type(failure), failure, failure.__traceback__))[-4000:],
@@ -277,10 +288,19 @@ class InProcessTransport(Transport):
         becomes "Protocol error" by the time a user sees it."""
         if msg_id is None:
             return
-        self.emit_message({
-            "id": msg_id,
-            "error": {"error": _error_payload(failure)},
-        })
+        out: Dict[str, Any] = {"id": msg_id,
+                               "error": {"error": _error_payload(failure)}}
+        # An error that carries details for the client (`ExpectNotMet`) sends
+        # them where `Connection.dispatch` reads them.
+        details = getattr(failure, "details", None)
+        if details is not None:
+            out["errorDetails"] = details
+        # And its call log, where `Connection.dispatch` reads it: the client
+        # prints it under "Call log:" ([B341]).
+        log = getattr(failure, "log", None)
+        if log:
+            out["log"] = list(log)
+        self.emit_message(out)
 
 # ── choosing one ────────────────────────────────────────────────────────────
 #

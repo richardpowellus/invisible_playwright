@@ -36,13 +36,14 @@ realness gate.
 from __future__ import annotations
 
 import http.server
-import socketserver
 import threading
 from pathlib import Path
 
 import pytest
 
 from invisible_playwright import InvisiblePlaywright
+
+from _servers import LocalServer
 
 _VENDOR = Path(__file__).parent / "vendor"
 _BOTD = "botd-2.0.0.esm.js"
@@ -135,7 +136,7 @@ class _DetectorSite:
             def log_message(self, *a):
                 pass
 
-        self._srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        self._srv = LocalServer(("127.0.0.1", 0), H)
         self.port = self._srv.server_address[1]
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
 

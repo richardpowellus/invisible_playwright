@@ -62,6 +62,7 @@ def test_solid_webgl_readback_stays_pure_under_noise(noised_page):
         f"solid WebGL readback not pure under noise: values {res['vals']} (uniform-skip regressed?)"
 
 
-# NOTE: "high-entropy WebGL still noised" is covered by test_webgl_noise_active.py
+# NOTE: "a realistic WebGL render varies per seed, a flat clear reads back exact" is covered by
+# test_webgl_noise_active.py
 # (kept separate: it launches its own browsers, so it must not run while this
 # module's shared `noised_page` browser is open - the sync API cannot nest).

@@ -31,10 +31,11 @@ be, and the failure surfaces later, in a property access far from the cause.
 """
 from __future__ import annotations
 
+import contextvars
 import itertools
 import os
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import perimeter
 # One class for a target that is gone, raised here for a disposed object and
@@ -51,6 +52,46 @@ class ProtocolException(Exception):
     caused: the message travels all the way to the user, and "Element is not
     visible" is a different day than "TypeError".
     """
+
+
+class ExpectNotMet(ProtocolException):
+    """An `expect()` whose condition did not hold within its timeout.
+
+    `details` travels as the reply's `errorDetails`, which is what the client
+    reads (`_frame.py` `_expect`) to build its AssertionError: `received` is
+    the last value seen, serialized, and `timedOut` says the wait ran out."""
+
+    def __init__(self, message: str, details: Dict,
+                 log: Optional[List[str]] = None) -> None:
+        super().__init__(message)
+        self.details = details
+        #: The call's log, which the reply carries as `log` ([B341]).
+        self.log = list(log or [])
+
+
+class CallLog:
+    """What one call did, line by line: the log Playwright's server keeps per
+    call (its progress, `metadata.log`) and sends with a failure, where the
+    client prints it under "Call log:" ([B341]). `title` is the one the
+    client sent in the call's metadata, as Playwright's `renderTitleForCall`
+    reads it, or the method's name."""
+
+    def __init__(self, title: str) -> None:
+        self.title = title
+        self.lines: List[str] = []
+
+    def log(self, line: str) -> None:
+        self.lines.append(line)
+
+
+#: The call this thread is answering. Set by `Server.handle` around the
+#: dispatch; each worker thread answers one call at a time.
+_CURRENT_CALL: "contextvars.ContextVar[CallLog]" = contextvars.ContextVar("call")
+
+
+def current_call() -> CallLog:
+    """The log of the call being answered, or a fresh one outside a call."""
+    return _CURRENT_CALL.get(None) or CallLog("")
 
 
 class Dispatcher:
@@ -448,7 +489,12 @@ class Server:
             raise ProtocolException(
                 "no object %r to answer %r: it was never created"
                 % (guid, method))
-        return obj.call(method, params)
+        metadata = message.get("metadata") or {}
+        token = _CURRENT_CALL.set(CallLog(metadata.get("title") or method or ""))
+        try:
+            return obj.call(method, params)
+        finally:
+            _CURRENT_CALL.reset(token)
 
     def handle_root(self, method: str, params: Dict) -> Any:
         raise ProtocolException("the root has no method %r" % method)

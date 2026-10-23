@@ -108,6 +108,7 @@ profile disagree with the browser, on about 12% of seeds.
 | `screen.height` | int | `1440` |
 | `screen.dpr` | float | `1.0`, `1.25`, `1.5`, `2.0` |
 | `screen.color_depth` | int | `24` | `screen.colorDepth` and `screen.pixelDepth`. Declared rather than read off the panel: the engine only returned a fixed 24 when resistFingerprinting was on, which we do not turn on because it is itself a tell, so before this it reported the real display - 30 on a wide-gamut monitor, and a persona claiming an office laptop with a 30-bit panel is a contradiction a page can read. |
+| `screen.refresh_hz` | int | `60`, `144` | The monitor's refresh rate, which is the cadence of `requestAnimationFrame`: a page reads it from the gap between two frame timestamps. Without it the engine follows the host's display, so one persona answered about 120 on one machine and 58 on another. Not sampled: 60 is what an office laptop or monitor runs at, and a 144 Hz persona is one pin away. |
 
 ### `hardware.*`
 
@@ -116,8 +117,9 @@ profile disagree with the browser, on about 12% of seeds.
 | `hardware.concurrency` | int | `16` | [`navigator.hardwareConcurrency`](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/hardwareConcurrency). |
 | `hardware.storage_quota_mb` | int | `10_000` | `navigator.storage.estimate().quota / 1024**2`. |
 | `hardware.max_touch_points` | int | `0` | `navigator.maxTouchPoints`. `0` is what a desktop without a touchscreen reports, which is what the personas claim; it was a constant compiled into the binary until 2026-08-08, correct but not inspectable and not overridable. |
-| `hardware.voices` | str | *(five en-US voices)* | The speechSynthesis voice list, as the engine parses it: `name\|lang\|default\|localService`, comma separated. Always the English (United States) set today, whatever locale the session resolved to - a real Windows machine running in Italian reports Italian voices, so an it-IT session declaring only American ones contradicts itself. The per-locale tables have to be measured on a real install of each locale, not invented; this field is the level at which that becomes possible. |
+| `hardware.voices` | str | *(the session language's voices)* | The speechSynthesis voice list, as the engine parses it: `name\|lang\|default\|localService`, comma separated. Unpinned, it follows the session's first language: English gives the English (United States) set, Italian the set of a Windows with English UI and Italian added, as measured on one; a language without a measured set keeps the English one, because a table has to be measured on a real install, not invented. A pin wins over the table. |
 | `hardware.fake_media_devices` | bool | `True` | One fake audio input and one fake video input on every host, so `enumerateDevices` does not report the machine's real hardware. Measured in a secure context (about:blank is not one, and measuring there made the two hosts look like they agreed because both returned nothing): Linux enumerated 0 real devices and Windows 2. |
+| `hardware.media_enumeration_ms` | int | `412` | How long the first `navigator.mediaDevices.enumerateDevices()` of a session takes, in ms. With `fake_media_devices` the engine no longer asks the host's audio stack for its speakers, whose time it was (15-40 ms on Linux, about 300 on Windows), and answers after this long on every host; later calls are fast, as in Firefox. Drawn from the seed between 240 and 640, the range retail Windows Firefox took on one machine in two states. Ignored with real devices. Needs firefox-45. |
 | `hardware.storage_enabled` | bool | `True` | Whether cookies, localStorage, sessionStorage and indexedDB all work. One field for four booleans because Gecko exposes them through two levers, not four. They used to be true because nobody touched `network.cookie.cookieBehavior` or `dom.storage.enabled`, i.e. because the upstream defaults happened to be right. |
 | `hardware.generics` | str | *(20 rows)* | The CSS generic families, as `generic\|lang\|family` records separated by newlines. It was ten rows compiled into gfxPlatformFontList.cpp; the `x-math` row is load-bearing and easy to lose, because without it every MathML glyph renders in Times New Roman on every host, which no cross-OS gate can see. |
 | `hardware.accessibility_overrides` | bool | `False` | Reduced motion, reduced transparency and inverted colours. Content-exposed media features that read the HOST through different code on each platform. They agreed across our two builds when measured - by luck, both machines having no accessibility settings on - and nothing declared them. Costs nothing to close: Firefox reads these generic prefs before the native path. |
@@ -166,7 +168,8 @@ would be the signal. They are pinnable for A/B work, not for realism.
 
 | Key | Type | Example | Notes |
 |-----|------|---------|-------|
-| `font.ui_family` | str | `"Segoe UI"` | Family behind `font: menu`, `font: caption`, and the `-moz-` widget fonts. |
+| `font.ui_family` | str | `"Segoe UI"` | Family behind `font: menu` and `font: caption`. The form-control fonts take `font.dialog_family`. |
+| `font.dialog_family` | str | `"MS Shell Dlg 2"` | The family of the form-control fonts, `-moz-button`, `-moz-field` and `-moz-list`, which is not the shell font: Windows Firefox builds them from the message font under the name "MS Shell Dlg 2", and a page reads it with one `getComputedStyle(input).fontFamily`. |
 | `font.ui_size` | str | `"12"` | **A string, not an int.** Gecko reads this pref through `Preferences::GetFloat`, which parses the value from its text form; an int is not rejected, it is ignored, and the UI silently falls back to 16px. |
 | `font.monospace_size` | int | `13` | Default monospace size. Firefox ships 13 on Windows and 12 in its Unix block, and the gap is directly readable as the width of the `monospace` generic at the default size. |
 | `font.alpha_ladder` | tuple of int | `(0, 18, 35, ..., 255)` | The distinct alpha levels a Windows rasteriser leaves on an antialiased glyph edge, ascending, first `0` and last `255` so a fully transparent or fully opaque pixel never moves. Canvas readback snaps onto these. An empty tuple disables the snap, which is what you want when measuring what the unsnapped edge looks like. |
@@ -178,15 +181,43 @@ would be the signal. They are pinnable for A/B work, not for realism.
 | `font.cleartype_rendering_mode` | int | `5` | DirectWrite rendering mode. |
 | `font.freetype_gamma` | int | `220` | The FreeType equivalent of `cleartype_gamma`, x100. Declared so the Linux build rasterises with Windows' curve instead of Skia's linear default. |
 | `font.freetype_contrast` | int | `100` | The FreeType equivalent of `cleartype_contrast`, x100. |
+| `font.system_text_quality` | int | `5` | The text quality the engine would otherwise ask the host for: `0` none, `4` standard antialiasing, `5` ClearType. It decides whether the ClearType parameters above apply at all, so on a machine with ClearType off (an RDP session, a VM, a Server) the same binary would draw different text from the same declaration. Declared, never asked of the machine. Any other value is refused. |
+
+### `desktop.*`
+
+The Windows desktop settings a page can read, declared instead of asked of the
+machine. Each one is a value whose engine default either reads the host or
+differs between Windows and Linux, so without it the same persona answered
+with the machine it ran on. The defaults are a Windows 11 desktop at its
+defaults, and they are not sampled.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `desktop.text_scale` | int | `100` | Windows' "Text size" slider, in percent. It multiplies the device pixel ratio, so `100` is the value that leaves `screen.dpr` the one number for it. |
+| `desktop.overlay_scrollbars` | bool | `True` | Windows 11's "Automatically hide scroll bars": scrollbars draw over the content, so a scrolling box loses no width (`offsetWidth - clientWidth` is 0). Off, they take `desktop.scrollbar_size`. |
+| `desktop.scrollbar_style` | int | `5` | How scrollbars are drawn: 5 Windows 11, 4 Windows 10, 2 GTK. |
+| `desktop.scrollbar_size` | int | `17` | The width a scrollbar takes when it is not an overlay, at 96 dpi. |
+| `desktop.drag_threshold` | int | `3` | How far the pointer moves before `dragstart`. |
+| `desktop.scroll_to_click` | bool | `False` | A click in a scrollbar's track jumps there instead of paging. |
+| `desktop.document_colors` | int | `0` | When the page's colours give way to the system's: `0`, the Windows default, only under a high-contrast theme. |
+| `desktop.select_styling` | bool | `True` | A page may style a `<select>`'s popup, as on Windows. |
+| `desktop.word_select_eats_space` | bool | `True` | A double click selects the word and the space after it, as on Windows; a page reads it with `getSelection()` after a real double click. |
+| `desktop.srgb_output` | bool | `True` | Tagged images are converted to sRGB instead of the host monitor's colour profile, which a small canvas reads back. |
+| `desktop.os_client_certs` | bool | `False` | Whether the operating system's personal certificates answer a server that asks for one. Off: the persona has none. |
+| `desktop.theme_accent` | bool | `False` | Whether the page-visible `AccentColor` follows the desktop theme's accent; on Windows it does not. |
+| `desktop.hour_cycle` | int | `0` | The clock format, `0` meaning the locale decides, as on Windows; otherwise the host's 12/24-hour setting changes every `toLocaleTimeString()`. |
+| `desktop.select_on_focus` | bool | `True` | Tabbing into a pre-filled field selects all of it, as on Windows. |
+| `desktop.palette` | str | *(the Windows palette)* | The system colours, light and dark, as `ui.<name>\|<light>\|<dark>` records, one per line, the dark part empty where the scheme does not move it. Every persona carries both schemes; `dark_theme` says which one it uses. |
 
 ### Top-level
 
 | Key | Type | Example | Notes |
 |-----|------|---------|-------|
 | `dark_theme` | bool | `False` | [`prefers-color-scheme: dark`](https://developer.mozilla.org/en-US/docs/Web/CSS/@media/prefers-color-scheme). Real traffic is ~85% light, 15% dark. |
+| `branding` | str | `"official"`, `"unofficial"`, `"C:/brand/branding.zip"` | The branding a page can read at `chrome://branding/content/` and `resource://usercontext-content/branding/`: the about dialog's stylesheet, the wordmarks' boxes, the logos' sizes. `"official"` (the default) is the retail Firefox's files, `"unofficial"` those of a build without the trademark, and an absolute path is a zip archive of your own holding exactly the same 16 file names at its root; anything else raises when the profile is built. An archive and not a folder because the engine serves it the way Firefox serves its own branding, from inside an archive: served from a folder, a page could tell the difference. The engine keeps no copy of its own. Needs firefox-48. |
 
-`dark_theme` is the ONLY top-level key. Anything else raises `ValueError: pin key
-'...' is not valid`.
+`dark_theme` and `branding` are the ONLY top-level keys. Anything else raises
+`ValueError: pin key '...' is not valid`.
 
 **`fonts` is not one of them, and no longer exists as an axis.** This table used
 to list a per-profile font allowlist ("the sampler usually picks 14-24 system

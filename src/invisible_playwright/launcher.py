@@ -1,7 +1,6 @@
 """Sync Playwright launcher for invisible_playwright."""
 from __future__ import annotations
 
-import secrets
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -11,7 +10,7 @@ from invisible_playwright._pw.sync_api import Browser, BrowserContext, Playwrigh
 from . import _session
 from ._cursor import resolve_cursor_engine
 from invisible_core._fpforge import Profile, generate_profile
-from invisible_core import SessionLocale, persona_cookies, prepare_session_geo
+from invisible_core import SessionLocale, persona_cookies, prepare_session_geo, record_session_seed, resolve_session_seed
 from ._engine import assert_wire_version, resolve_executable
 from invisible_core import configure_proxy as _configure_proxy_shared
 from ._reaper import SessionToken, guard_for
@@ -53,13 +52,6 @@ from ._reaper import SessionToken, guard_for
 # field of the profile now (ScreenProfile.taskbar_px), pinnable like any other,
 # and the use sites below read it from there. This name survives only because
 # async_api imports it, and it resolves to the same declaration.
-
-# The IANA -> POSIX TZ table moved to `_session` on 2026-07-27, so the async
-# class no longer has to import it FROM the sync module. Re-exported under the
-# original names because tests and `async_api` import them from here.
-_IANA_TO_POSIX_TZ = _session._IANA_TO_POSIX_TZ
-_tz_env = _session.tz_env
-
 
 class InvisiblePlaywright(_session.CommonLaunch):
     """Context manager launching a patched Firefox with a deterministic profile.
@@ -187,7 +179,9 @@ class InvisiblePlaywright(_session.CommonLaunch):
         # interpreted as negative on the C++ side, where the noise hooks
         # bail out on ``seed <= 0`` - which produces bit-identical audio
         # / canvas fingerprints across half the sessions.
-        self.seed: int = int(seed) if seed is not None else secrets.randbits(31)
+        # One place decides the seed, and a profile directory remembers it
+        # (invisible_core.resolve_session_seed, B314).
+        self.seed: int = resolve_session_seed(seed, profile_dir)
         self._pin = pin
         self._headless = headless
         self._proxy = proxy
@@ -284,16 +278,15 @@ class InvisiblePlaywright(_session.CommonLaunch):
         # binary_path= never reaches ensure_binary(), so the engine check lives
         # on the resolved executable rather than inside the fetcher.
         executable = resolve_executable(self._binary_path)
-        # the REAL result of _resolve_headless (did it create an alternate
-        # desktop or not?) must be known BEFORE composing the prefs, not
-        # after: B172, 2026-08-24.
-        pw_headless = self._resolve_headless()
-        prefs = self._build_prefs()
-        playwright_proxy = _configure_proxy_shared(self._proxy, prefs)
-        self._session_token = SessionToken.mint()
-        env = self._build_env(prefs)
-
         try:
+            # the REAL result of _resolve_headless (did it create an alternate
+            # desktop or not?) must be known BEFORE composing the prefs, not
+            # after: B172, 2026-08-24.
+            pw_headless = self._resolve_headless()
+            prefs = self._build_prefs()
+            playwright_proxy = _configure_proxy_shared(self._proxy, prefs)
+            self._session_token = SessionToken.mint()
+            env = self._build_env(prefs)
             self._pw = sync_playwright().start()
             if self._profile_dir is not None:
                 # Persistent context - cookies / localStorage / extensions /
@@ -350,6 +343,8 @@ class InvisiblePlaywright(_session.CommonLaunch):
                 # was REMOVED once the origin was found, so that only one place
                 # knows the fact.
                 self._profile_dir.mkdir(parents=True, exist_ok=True)
+                # The profile is this machine from now on (B314).
+                record_session_seed(self._profile_dir, self.seed)
                 self._persistent_context = self._pw.firefox.launch_persistent_context(
                     user_data_dir=str(self._profile_dir),
                     executable_path=str(executable),

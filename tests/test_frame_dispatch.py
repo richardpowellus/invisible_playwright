@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from invisible_playwright._juggler.dispatcher import Dispatcher, ProtocolException
+from invisible_core.juggler.connection import EventListeners
 from invisible_core.juggler.lifecycle import Lifecycle
 from invisible_playwright._juggler.server import (
     FrameDispatcher,
@@ -21,9 +22,12 @@ def page():
     messages = []
     server.attach(SimpleNamespace(emit_message=messages.append))
     context = Dispatcher(server, None)
+    context.options = {}    # created without a base URL
     page = object.__new__(PageDispatcher)
     page.context = context
-    page.lifecycle = Lifecycle(SimpleNamespace(add_listener=lambda listener: None), "session")
+    # The connection's own registry, as every stand-in for it inherits
+    # (`EventListeners`): it carries the event count the lifecycle reads.
+    page.lifecycle = Lifecycle(EventListeners(), "session")
     page.injected = Mock()
     page.actions = Mock()
     page._frames = {}
@@ -64,30 +68,56 @@ def test_wait_for_selector_returns_a_handle_owned_by_the_resolved_frame(page, cr
     assert handle.parent is widget
 
 
-@pytest.mark.parametrize("method,params,read,args", [
-    ("op_text_content", {}, "text_content", ()),
-    ("op_inner_text", {}, "inner_text", ()),
-    ("op_inner_html", {}, "inner_html", ()),
-    ("op_input_value", {}, "input_value", ()),
-    ("op_get_attribute", {"name": "id"}, "get_attribute", ("id",)),
-    ("op_is_checked", {}, "element_state", ("checked",)),
+@pytest.mark.parametrize("method,params,what,args", [
+    ("op_text_content", {}, "textContent", ()),
+    ("op_inner_text", {}, "innerText", ()),
+    ("op_inner_html", {}, "innerHTML", ()),
+    ("op_input_value", {}, "inputValue", ()),
+    ("op_get_attribute", {"name": "id"}, "attribute", ("id",)),
+    ("op_is_checked", {}, "state", ("checked",)),
 ])
-def test_frame_crossing_reads_use_the_handle_world(page, method, params, read, args):
+def test_frame_crossing_reads_run_in_the_resolved_frame(page, method, params, what, args):
+    """The read is made in the frame the compound selector resolved to, with
+    the selector that is left. Since 0.34.1 the element is found and read in
+    one command (`read_match`), so no handle crosses and none is disposed."""
     page.frame.enter_frames = Mock(return_value=("widget", "#target"))
-    page.injected.query_selector.return_value = "node"
-    getattr(page.injected, read).return_value = "answer"
-    assert getattr(page.frame, method)({"selector": "compound", **params}) == {"value": "answer"}
-    getattr(page.injected, read).assert_called_once_with("widget", "node", *args)
-    page.injected.dispose.assert_called_once_with("widget", "node")
+    page.injected.read_match.return_value = (True, "answer")
+    assert getattr(page.frame, method)(
+        {"selector": "compound", "strict": True, "timeout": 100, **params}
+    ) == {"value": "answer"}
+    call = page.injected.read_match.call_args
+    assert call.args == ("widget", "#target", what, *args)
+    assert call.kwargs["strict"] is True
 
 
-def test_failed_read_disposes_in_the_resolved_frame(page):
+def test_a_failed_read_reaches_the_caller_as_it_is(page):
     page.frame.enter_frames = Mock(return_value=("widget", "#target"))
-    page.injected.query_selector.return_value = "node"
-    page.injected.text_content.side_effect = RuntimeError("document gone")
+    page.injected.read_match.side_effect = RuntimeError("document gone")
     with pytest.raises(RuntimeError, match="document gone"):
         page.frame.op_text_content({"selector": "compound"})
-    page.injected.dispose.assert_called_once_with("widget", "node")
+
+
+def test_a_read_waits_for_a_match_within_the_callers_timeout(page):
+    """Playwright's reads wait for the element; until 0.34.1 a missing one
+    failed at once with "no element matches"."""
+    page.frame.enter_frames = Mock(return_value=("widget", "#target"))
+    page.injected.read_match.side_effect = [(False, None), (False, None),
+                                            (True, "late")]
+    assert page.frame.op_inner_text({"selector": "compound",
+                                     "timeout": 5000}) == {"value": "late"}
+    page.injected.read_match.side_effect = None
+    page.injected.read_match.return_value = (False, None)
+    with pytest.raises(TimeoutError, match="Timeout 200ms exceeded"):
+        page.frame.op_inner_text({"selector": "compound", "timeout": 200})
+
+
+@pytest.mark.parametrize("method,missing", [("op_is_visible", False),
+                                            ("op_is_hidden", True)])
+def test_visibility_answers_now_and_a_missing_element_is_hidden(page, method, missing):
+    page.frame.enter_frames = Mock(return_value=("widget", "#target"))
+    page.injected.read_match.return_value = (False, None)
+    assert getattr(page.frame, method)({"selector": "compound"}) == {"value": missing}
+    assert page.injected.read_match.call_count == 1
 
 
 def test_frame_element_adopts_into_parent_world(page):
@@ -218,7 +248,15 @@ def test_every_element_callback_receives_the_caller_s_argument(page, method, rec
 
     page.frame.enter_frames = Mock(return_value=("widget", "#target"))
     page.injected.query_selector.return_value = "node"
-    page.injected.call.return_value = 6
+    page.injected.query_selector_all.return_value = ["node"]
+    page.injected.caller_context.return_value = "caller-ctx"
+    page.injected.node_to_caller.return_value = "copy"
+    # The caller's text is evaluated as a script, and the function it makes is
+    # called with the receivers and the argument as protocol values ([B340]).
+    page.injected.evaluate_raw.return_value = {"type": "function", "objectId": "fn"}
+    from invisible_playwright._juggler.server import _ARRAY, _CALL
+    page.injected.call_raw.side_effect = lambda context, script, args, **k: (
+        {"objectId": "array"} if script == _ARRAY else {"value": 6})
     params = {"selector": "compound", "expression": "(x, a) => a",
               "arg": {"value": {"o": [{"k": "n", "v": {"n": 2}}]}, "handles": []}}
     if method == "handle.evaluate":
@@ -226,8 +264,15 @@ def test_every_element_callback_receives_the_caller_s_argument(page, method, rec
                                 "node").call("evaluateExpression", params)
     else:
         page.frame.call(method, params)
-    script = page.injected.call.call_args.args[1]
-    assert ("r(%s, {\"n\": 2})" % receiver) in script, script
+    # the caller's code, in the caller's world, on the node carried there [B322]
+    calls = [c.args[:3] for c in page.injected.call_raw.call_args_list]
+    [(context, _, args)] = [c for c in calls if c[1] == _CALL]
+    assert context == "caller-ctx"
+    held = {"objectId": "array" if receiver == "els" else "copy"}
+    assert args == [{"objectId": "fn"}, held, {"value": {"n": 2}}], args
+    if receiver == "els":
+        [(_, _, items)] = [c for c in calls if c[1] == _ARRAY]
+        assert items == [{"objectId": "copy"}], items
 
 
 def test_networkidle_reaches_the_client_as_a_load_state(page):
@@ -249,3 +294,191 @@ def test_networkidle_reaches_the_client_as_a_load_state(page):
     added = [m["params"] for m in page.messages
              if m["guid"] == page.frame.guid and m["method"] == "loadstate"]
     assert {"add": "networkidle"} in added, added
+
+
+def _events(page, method):
+    return [m for m in page.messages if m.get("method") == method]
+
+
+def test_frames_reach_the_client_from_the_lifecycle_alone(page):
+    """The main frame re-announced by a cross-process navigation is not a new
+    frame, and a new document retires the old one's frames. Until 0.34.1 the
+    page answered the engine's raw events itself: `page.frames` grew by a
+    stale iframe and a repeated main frame at every such navigation."""
+    page.frame_for("widget")
+    page.lifecycle.announce = page._on_lifecycle
+    on = page.lifecycle._on_event
+    on("Page.frameAttached", {"frameId": "main"})
+    assert _events(page, "frameAttached") == []
+    on("Page.navigationCommitted", {"frameId": "main", "navigationId": "n2",
+                                    "url": "http://b/"})
+    detached = [m["params"]["frame"]["guid"] for m in _events(page, "frameDetached")]
+    assert len(detached) == 2 and page._frames == {}
+    on("Page.frameAttached", {"frameId": "fresh", "parentFrameId": "main"})
+    attached = _events(page, "frameAttached")
+    assert len(attached) == 1
+    assert attached[0]["params"]["frame"]["guid"] == page._frames["fresh"].guid
+
+
+def _reading(matches, received=None, **more):
+    """One reading as the injected script's `expect` answers it."""
+    out = {"matches": matches, "missingReceived": False}
+    if received is not None:
+        out["received"] = received
+    out.update(more)
+    return out
+
+
+def test_expect_polls_until_the_condition_holds(page):
+    # The locator the wait names, from the injected script's `asLocator` ([B341]).
+    page.injected.call.return_value = 'locator("x")'
+    page.frame._expect_probe = Mock(side_effect=[_reading(False, 0), _reading(False, 1),
+                                                 _reading(True, 2)])
+    assert page.frame.op_expect({"expression": "to.have.count", "selector": "x",
+                                 "timeout": 5000}) is None
+    assert page.frame._expect_probe.call_count == 3
+
+
+def test_expect_not_inverts_and_a_condition_that_never_holds_carries_details(page):
+    from invisible_playwright._juggler.dispatcher import ExpectNotMet
+
+    # The locator the wait names, from the injected script's `asLocator` ([B341]).
+    page.injected.call.return_value = 'locator("x")'
+    page.frame._expect_probe = Mock(return_value=_reading(True, "checked"))
+    with pytest.raises(ExpectNotMet) as caught:
+        page.frame.op_expect({"expression": "to.be.checked", "selector": "x",
+                              "isNot": True, "timeout": 300})
+    assert caught.value.details == {"received": {"value": {"s": "checked"}},
+                                    "timedOut": True}
+    assert page.frame.op_expect({"expression": "to.be.checked", "selector": "x",
+                                 "isNot": False, "timeout": 300}) is None
+
+
+def test_a_missing_element_says_so_as_playwright_does(page):
+    """`element(s) not found` is the message upstream's server writes when the
+    reading says nothing matched, and the aria snapshot of the page travels
+    with the last value, for the error the client renders."""
+    from invisible_playwright._juggler.dispatcher import ExpectNotMet
+
+    # The locator the wait names, from the injected script's `asLocator` ([B341]).
+    page.injected.call.return_value = 'locator("x")'
+    page.frame._expect_probe = Mock(return_value={
+        "matches": False, "missingReceived": True, "ariaSnapshot": "- main"})
+    with pytest.raises(ExpectNotMet) as caught:
+        page.frame.op_expect({"expression": "to.have.text", "selector": "#nope",
+                              "timeout": 200})
+    assert caught.value.details == {"received": {"ariaSnapshot": "- main"},
+                                    "customErrorMessage": "element(s) not found",
+                                    "timedOut": True}
+
+
+def test_a_javascript_error_in_the_reading_ends_the_wait_with_its_message(page):
+    """A strict-mode violation cannot start to hold later: upstream raises it at
+    once as the message, and so does this, without spending the timeout."""
+    import time as _time
+
+    from invisible_core.juggler.injected import EvaluationError
+    from invisible_playwright._juggler.dispatcher import ExpectNotMet
+
+    # The locator the wait names, from the injected script's `asLocator` ([B341]).
+    page.injected.call.return_value = 'locator("x")'
+    page.frame._expect_probe = Mock(side_effect=EvaluationError(
+        "Error: strict mode violation: locator('button') resolved to 2 elements\n"
+        "    at strictModeViolationError"))
+    started = _time.monotonic()
+    with pytest.raises(ExpectNotMet) as caught:
+        page.frame.op_expect({"expression": "to.have.text", "selector": "button",
+                              "timeout": 5000})
+    assert _time.monotonic() - started < 2
+    assert caught.value.details == {
+        "customErrorMessage": "strict mode violation: locator('button') resolved to 2 elements"}
+    assert page.frame._expect_probe.call_count == 1
+
+
+def test_a_navigation_under_the_reading_is_read_again(page):
+    from invisible_core.juggler.injected import ContextDestroyed
+
+    # The locator the wait names, from the injected script's `asLocator` ([B341]).
+    page.injected.call.return_value = 'locator("x")'
+    page.frame._expect_probe = Mock(side_effect=[ContextDestroyed("gone"), _reading(True, "x")])
+    assert page.frame.op_expect({"expression": "to.have.text", "selector": "p",
+                                 "timeout": 5000}) is None
+    assert page.frame._expect_probe.call_count == 2
+
+
+def test_the_reading_is_the_injected_scripts_expect_with_playwrights_options(page):
+    """The options the caller sent, as upstream hands them over: `expectedValue`
+    parsed, everything else as it came, and the page-level conditions with no
+    selector at all."""
+    calls = []
+
+    def call(frame_id, declaration, sel, options):
+        calls.append((frame_id, declaration, sel, options))
+        return {"matches": True, "missingReceived": False}
+
+    page.injected = Mock()
+    page.injected.call = call
+    page.frame.enter_frames = lambda selector: ("main", selector)
+    page.frame._expect_probe("to.have.property", "#x", {
+        "expression": "to.have.property", "expressionArg": "a.b", "selector": "#x",
+        "expectedValue": {"value": {"n": 3}, "handles": []}, "isNot": False,
+        "timeout": 1000})
+    page.frame._expect_probe("to.have.title", None, {
+        "expression": "to.have.title", "isNot": False,
+        "expectedText": [{"string": "T", "matchSubstring": False}]})
+    (_, declaration, sel, options), (_, _, sel2, options2) = calls
+    assert "injected.expect(element, options, elements)" in declaration
+    assert "strictModeViolationError" in declaration
+    assert sel == "#x" and options == {
+        "expression": "to.have.property", "expressionArg": "a.b", "selector": "#x",
+        "isNot": False, "expectedValue": 3}
+    assert sel2 is None and options2["expectedText"] == [{"string": "T", "matchSubstring": False}]
+
+
+@pytest.mark.parametrize("value", [
+    {"o": [{"k": "a", "v": {"n": 1}}], "id": 1},
+    {"a": [{"n": 1}], "id": 1},
+    {"d": "2021-07-28T20:26:32.000Z"},
+    {"r": {"p": "x", "f": ""}},
+])
+def test_a_structured_js_property_is_refused_rather_than_called_different(page, value):
+    """Across realms Playwright's `deepEquals` calls two equal objects different;
+    the refusal says so instead of failing an assertion that holds."""
+    from invisible_playwright._juggler.dispatcher import ProtocolException
+
+    page.injected = Mock()
+    with pytest.raises(ProtocolException, match="another realm"):
+        page.frame._expect_probe("to.have.property", "div", {
+            "expression": "to.have.property", "expressionArg": "foo",
+            "expectedValue": {"value": value, "handles": []}})
+    assert not page.injected.call.called
+
+
+@pytest.mark.parametrize("value", [{"n": 3}, {"s": "x"}, {"b": True}, {"v": "null"}])
+def test_a_primitive_js_property_is_compared(page, value):
+    page.injected = Mock()
+    page.injected.call = Mock(return_value={"matches": True, "missingReceived": False})
+    page.frame.enter_frames = lambda selector: ("main", selector)
+    assert page.frame._expect_probe("to.have.property", "div", {
+        "expression": "to.have.property", "expressionArg": "foo",
+        "expectedValue": {"value": value, "handles": []}})["matches"] is True
+
+
+def test_to_match_aria_is_refused_by_name(page):
+    from invisible_playwright._juggler.dispatcher import ProtocolException
+
+    with pytest.raises(ProtocolException, match="to.match.aria"):
+        page.frame._expect_probe("to.match.aria", "main", {"expression": "to.match.aria"})
+
+
+def test_an_error_with_details_sends_them_where_the_client_reads_them():
+    from invisible_playwright._juggler.dispatcher import ExpectNotMet
+    from invisible_playwright._juggler.transport import InProcessTransport
+
+    sent = []
+    transport = object.__new__(InProcessTransport)
+    transport.emit_message = sent.append
+    transport.reply_error(7, ExpectNotMet("no", {"timedOut": True}))
+    transport.reply_error(8, RuntimeError("plain"))
+    assert sent[0]["errorDetails"] == {"timedOut": True}
+    assert "errorDetails" not in sent[1]

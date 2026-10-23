@@ -39,8 +39,11 @@ from typing import Any, Dict, List, Optional
 from invisible_core.juggler import PageActs, popup_number
 from invisible_core.juggler import connection as juggler
 from ._credential_fill import CredentialActions as Actions
-from .dispatcher import Dispatcher, ProtocolException, Server
-from invisible_core.juggler.injected import InjectedScript
+from invisible_core.juggler.deadline import Deadline
+from .dispatcher import (Dispatcher, ExpectNotMet, ProtocolException,
+                         Server, current_call)
+from invisible_core.juggler.injected import (ContextDestroyed, EvaluationError,
+                                             InjectedScript, js_truthy)
 from invisible_core.juggler.keyboard import MODIFIER_MASK
 from invisible_core.juggler.lifecycle import Lifecycle
 
@@ -50,10 +53,11 @@ from invisible_core.juggler.lifecycle import Lifecycle
 # from HERE, and a move that breaks its callers to tidy a file is not a
 # tidy-up. One definition, two names to reach it. (The profile helpers and the
 # `user.js` writer are the core's since 0.30.0, and their tests are there.)
-from ._marshal import (_as_callable, _button, _called_on, _console_text,
-                       _deserialize, _element_function, _guid_of,
+from ._marshal import (_js_number, _as_script, _button, _caller_timeout,
+                       _console_text,
+                       _deserialize, _guid_of,
                        _headers_array, _js_string, _location,
-                       _resource_type, _serialize, _with_argument)
+                       _resource_type, _serialize)
 # ⛔ THE PARSER IS THE CORE'S, and briefly it was not: a copy of it lived
 # here for the length of one fix. Two readings of what a proxy is would be
 # the same duplication that produced the defect, one layer down.
@@ -295,6 +299,131 @@ def _upload_paths(server: "JugglerServer", params: Dict) -> list:
             for payload in params.get("payloads") or []]
 
 
+#: The four numbers JSON cannot carry, as the engine names them in a
+#: RemoteObject's `unserializableValue` (`juggler/content/Runtime.js`).
+_UNSERIALIZABLE = {"NaN": float("nan"), "-0": -0.0,
+                   "Infinity": float("inf"), "-Infinity": float("-inf")}
+
+
+def _remote_value(remote: Dict) -> Any:
+    """The value of a RemoteObject that carries no objectId: a primitive."""
+    if "unserializableValue" in remote:
+        return _UNSERIALIZABLE[remote["unserializableValue"]]
+    return remote.get("value")
+
+
+#: Calls what the caller's script produced with the receivers, then the
+#: argument: Playwright's utility script calls `result(...args)` on what
+#: `eval` produced.
+_CALL = "(f, ...a) => f(...a)"
+#: Reads a caller's object by value, from the reference that holds it.
+_READ = "o => o"
+#: The receivers of `eval_on_selector_all`: one array, in the caller's world.
+_ARRAY = "(...a) => a"
+
+
+def _call_callers_function(injected: InjectedScript, context: str, function: str,
+                           receivers, params: Dict, *, by_value: bool) -> Dict:
+    """`function(...receivers, arg)` in the caller's world: the argument goes
+    as a protocol value, never into a text."""
+    return injected.call_raw(
+        context, _CALL,
+        [{"objectId": function}] + [{"objectId": r} for r in receivers]
+        + [{"value": _deserialize(params.get("arg"))}],
+        by_value=by_value)
+
+
+class _Predicate:
+    """The caller's `wait_for_function` predicate, turn by turn, as
+    Playwright's poll runs it ([B340]): the script is evaluated once in a
+    world, and when it produced a function, that function is called again on
+    every turn after, with the argument (Playwright keeps it as
+    `evaledExpression`); a script that is not a function is evaluated again on
+    each turn. A world that goes takes the function with it, and the next turn
+    evaluates the script in the new one."""
+
+    def __init__(self, injected: InjectedScript, frame_id: str, params: Dict) -> None:
+        self.injected = injected
+        self.frame_id = frame_id
+        self.params = params
+        #: (context, objectId) of the function, in the world that made it.
+        self.function: Optional[tuple] = None
+
+    def turn(self) -> Optional[Dict]:
+        """The value as a RemoteObject when JavaScript judges it truthy, None
+        when not; a falsy object is released here. `ContextDestroyed` passes
+        through, and any other failure releases the function first."""
+        injected = self.injected
+        context = injected.caller_context(self.frame_id)
+        try:
+            if self.function is None or self.function[0] != context:
+                self.function = None
+                remote = injected.evaluate_raw(
+                    context, _as_script(self.params["expression"]))
+                if remote.get("type") != "function":
+                    return self._judged(context, remote)
+                self.function = (context, remote["objectId"])
+            return self._judged(context, _call_callers_function(
+                injected, context, self.function[1], (), self.params,
+                by_value=False))
+        except ContextDestroyed:
+            self.function = None
+            raise
+        except BaseException:
+            self.release()
+            raise
+
+    def _judged(self, context: str, remote: Dict) -> Optional[Dict]:
+        if js_truthy(remote):
+            return remote
+        if "objectId" in remote:
+            self.injected.release(context, remote["objectId"])
+        return None
+
+    def release(self) -> None:
+        if self.function is not None:
+            context, object_id = self.function
+            self.function = None
+            self.injected.release(context, object_id)
+
+
+def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
+                      receivers=(), *, by_value: bool) -> Dict:
+    """THE ONE PLACE the caller's code runs ([B340]), the way Playwright's
+    utility script runs it: the caller's text is evaluated as a script in the
+    caller's world (`_as_script`), and when what it produced is a function,
+    that function is called with the receivers and the argument. The engine's
+    RemoteObject comes back, by value or by reference.
+
+    ⛔ THE PAGE SEES THE CALLER'S TEXT AND NOTHING ELSE. Until [B340] it was
+    put inside `(() => { const r = (TEXT); return typeof r === 'function' ?
+    r(ARG) : r; })()`, which refused every statement ("missing ) in
+    parenthetical" on `setTimeout(...);`, which Playwright runs) and was this
+    package's own code around the caller's, in a place a page can look at. The
+    call that follows is a protocol call like every other this server makes.
+
+    Sent once ([B285]): a world that goes under it is `ContextDestroyed`. The
+    function's reference is released after its call, and an object read by
+    value after the read, so a call leaves nothing behind in the page.
+    """
+    context = injected.caller_context(frame_id)
+    remote = injected.evaluate_raw(context, _as_script(params["expression"]))
+    if remote.get("type") == "function":
+        try:
+            return _call_callers_function(injected, context, remote["objectId"],
+                                          receivers, params, by_value=by_value)
+        finally:
+            injected.release(context, remote["objectId"])
+    if by_value and "objectId" in remote:
+        try:
+            return injected.call_raw(context, _READ,
+                                     [{"objectId": remote["objectId"]}],
+                                     by_value=True)
+        finally:
+            injected.release(context, remote["objectId"])
+    return remote
+
+
 class ElementHandleDispatcher(Dispatcher):
     TYPE = "ElementHandle"
     METHODS = {
@@ -329,16 +458,23 @@ class ElementHandleDispatcher(Dispatcher):
     }
 
     def __init__(self, server, frame: "FrameDispatcher", object_id: str,
-                 preview: str = "", *, world: str = "utility") -> None:
+                 preview: str = "", *, world: str = "utility",
+                 remote: Optional[Dict] = None) -> None:
         self.frame = frame
         self.object_id = object_id
-        # ⛔ WHICH WORLD THE objectId BELONGS TO. Almost every handle here is
-        # born in the utility world, where the rest of this server lives. One
-        # is not: `waitForFunction` runs the CALLER'S expression in the page's
-        # own world, so its result exists only there - and an objectId is not
-        # portable between worlds. A handle that lies about its world does not
-        # fail loudly: Juggler answers that the object does not exist, on a
-        # call the user thinks succeeded.
+        # A caller-world PRIMITIVE has no objectId: its value is the engine's
+        # RemoteObject, kept here so `json_value` can answer it [B324].
+        self.remote = remote or {}
+        # ⛔ WHICH WORLD THE objectId BELONGS TO, and every operation below
+        # runs there. Almost every handle is born in the utility world, where
+        # the rest of this server lives. A value the CALLER'S code produced in
+        # its own world is made into a handle by
+        # `FrameDispatcher._handle_from_caller`: a node is adopted into
+        # utility, anything else stays "caller". An objectId is not portable between
+        # worlds, and until 0.36.0 only `json_value` read this field: every
+        # other operation on an `evaluate_handle` or `wait_for_function` result
+        # asked the utility world about an objectId it had never seen and
+        # failed with "Cannot find object" [B324].
         self.world = world
         # ⛔ THE PARENT IS THE FRAME, NOT THE PAGE, and the parent is not
         # bookkeeping: `_element_handle.py` does `self._frame = cast("Frame",
@@ -368,7 +504,22 @@ class ElementHandleDispatcher(Dispatcher):
     def page(self) -> "PageDispatcher":
         return self.frame.page
 
+    def _in_caller(self, declaration: str, *args: Dict, by_value: bool) -> Dict:
+        """`declaration` called in the caller's world, where this handle
+        lives, with `null` where the utility world passes the injected script:
+        the same declarations serve both worlds, so there is one of each."""
+        return self.injected.call_raw(
+            self.injected.caller_context(self.frame.frame_id), declaration,
+            [{"value": None}, {"objectId": self.object_id}] + list(args),
+            by_value=by_value)
+
     def op_dispose(self, params: Dict) -> Any:
+        if self.world == "caller":
+            if self.object_id:
+                self.injected.release(
+                    self.injected.caller_context(self.frame.frame_id), self.object_id)
+            self.dispose()
+            return None
         try:
             self.injected.dispose(self.frame.frame_id, self.object_id)
         except Exception:
@@ -422,9 +573,12 @@ class ElementHandleDispatcher(Dispatcher):
         It was found by diffing the protocol against the Node driver: the
         driver's `click` carried a `position` and ours did not.
         """
-        return {"value": _serialize(self.injected.call(
-            self.frame.frame_id, _element_function(params),
-            {"objectId": self.object_id}))}
+        if self.world == "caller":
+            return {"value": _serialize(_remote_value(_run_callers_code(
+                self.injected, self.frame.frame_id, params, [self.object_id],
+                by_value=True)))}
+        return {"value": _serialize(self.frame._call_on_elements(
+            self.frame.frame_id, [self.object_id], params))}
 
     def op_text_content(self, params: Dict) -> Any:
         return {"value": self.injected.text_content(
@@ -447,6 +601,10 @@ class ElementHandleDispatcher(Dispatcher):
             self.frame.frame_id, self.object_id, params["name"])}
 
     def op_get_property(self, params: Dict) -> Any:
+        if self.world == "caller":
+            remote = self._in_caller("(injected, o, n) => o[n]",
+                                   {"value": params["name"]}, by_value=False)
+            return {"handle": self.frame._handle_from_caller(remote).channel}
         object_id = self.injected.call(
             self.frame.frame_id,
             "(injected, o, n) => o[n]",
@@ -459,6 +617,15 @@ class ElementHandleDispatcher(Dispatcher):
         large object this is the most expensive call in the file, which is why
         `json_value` exists and should be preferred when the values are
         serialisable."""
+        if self.world == "caller":
+            names = self._in_caller(
+                "(injected, o) => o === Object(o) ? Object.keys(o) : []",
+                by_value=True).get("value") or []
+            return {"properties": [
+                {"name": name, "value": self.frame._handle_from_caller(self._in_caller(
+                    "(injected, o, n) => o[n]", {"value": name},
+                    by_value=False)).channel}
+                for name in names]}
         names = self.injected.call(
             self.frame.frame_id,
             "(injected, o) => o === Object(o) ? Object.keys(o) : []",
@@ -483,9 +650,11 @@ class ElementHandleDispatcher(Dispatcher):
         caller can act on - it is an evaluation failure on a handle they were
         just given.
         """
-        if getattr(self, "world", "utility") == "main":
+        if self.world == "caller":
+            if not self.object_id:
+                return {"value": _serialize(_remote_value(self.remote))}
             return {"value": _serialize(self.injected.json_value_in(
-                self.frame.frame_id, "main", self.object_id))}
+                self.frame.frame_id, "caller", self.object_id))}
         return {"value": _serialize(self.injected.call(
             self.frame.frame_id, "(injected, o) => o",
             {"objectId": self.object_id}))}
@@ -693,6 +862,7 @@ class FrameDispatcher(Dispatcher):
         "setContent": "op_set_content",
         "evalOnSelector": "op_eval_on_selector",
         "evalOnSelectorAll": "op_eval_on_selector_all",
+        "readAll": "op_read_all",
         "selectOption": "op_select_option",
         "setInputFiles": "op_set_input_files",
         "tap": "op_tap",
@@ -753,11 +923,33 @@ class FrameDispatcher(Dispatcher):
 
 
     # ── navigation ──────────────────────────────────────────────────────────
+    def _navigation_url(self, url: str) -> str:
+        """The address `goto` navigates to: `url` resolved against the
+        context's `baseURL`, as Playwright's server does in `goto`
+        (`new URL(given, base).toString()`, and the given text as it is when
+        that throws). Until [B342] `baseURL` was read nowhere in this server,
+        so `goto("/empty.html")` with a base failed with "Invalid url".
+
+        ⛔ RESOLVED BY THE ENGINE'S OWN URL PARSER, in the utility world, not
+        with `urllib.parse.urljoin`: the URL standard and Python's RFC 3986
+        join disagree at the edges (dot segments, special schemes,
+        percent-encoding, hosts), and the address resolved here is the one the
+        engine then navigates to, so one parser does both. It costs one
+        evaluation, and only when the context has a base."""
+        base = self.page.context.options.get("baseURL")
+        if not base:
+            return url
+        return self.injected.call(
+            self.frame_id,
+            "(injected, given, base) => { try { return new URL(given, base).toString(); }"
+            " catch (e) { return given; } }",
+            url, base)
+
     def op_goto(self, params: Dict) -> Any:
         result = self.lifecycle.goto(
-            params["url"], frame_id=self.frame_id,
+            self._navigation_url(params["url"]), frame_id=self.frame_id,
             until=params.get("waitUntil") or "load",
-            timeout=(params.get("timeout") or 30000) / 1000.0)
+            timeout=self._timeout(params))
         # Navigation events come from the engine, not a snapshot taken when
         # goto's lifecycle wait finished: another navigation may follow it.
         # ⛔ `goto` answers with a Response CHANNEL or null, never with a URL.
@@ -788,74 +980,126 @@ class FrameDispatcher(Dispatcher):
             self.server, self.page.frame_for(frame_id), object_id)
         return {"element": handle.channel}
 
-    def _with_element(self, params: Dict, read):
+    def _read(self, params: Dict, what: str, *args) -> Any:
+        """A read of the element `params["selector"]` names, as Playwright's
+        `_callOnElementOnceMatches` makes it: wait, within the caller's
+        timeout, for an element to match, and read it.
+
+        ⛔ UNTIL 0.34.1 IT DID NOT WAIT, AND IT READ THROUGH A HANDLE. It
+        resolved once and failed with "no element matches" at once, where
+        Playwright waits: `inner_text` on an element added 700 ms later failed
+        immediately. And it was two commands, find then read, with a
+        navigation able to fall between them: right after `goto` on a page
+        that replaces itself the read was refused with the engine's raw
+        `Failed to find execution context`, 5 times in 5 (2026-10-12,
+        invisible_dots and here). `read_match` finds and reads in ONE command
+        of values, which the core makes again in the frame's current world if
+        the one it was aimed at has gone; this loop only waits for a match.
+        """
         frame_id, selector = self.enter_frames(params["selector"])
-        object_id = self.injected.query_selector(frame_id, selector)
-        if not object_id:
-            raise ProtocolException("no element matches %r" % selector)
-        try:
-            return {"value": read(frame_id, object_id)}
-        finally:
-            self.injected.dispose(frame_id, object_id)
+        strict = self._act_opts(params)["strict"]
+        deadline = Deadline(self._timeout(params))
+
+        def expired() -> TimeoutError:
+            return TimeoutError(
+                "Timeout %dms exceeded waiting for %r to match an element"
+                % (round(deadline.seconds * 1000), selector))
+
+        while True:
+            try:
+                found, value = self.injected.read_match(
+                    frame_id, selector, what, *args, strict=strict,
+                    timeout=deadline.left())
+            except juggler.ReplyTimeout as exc:
+                # The caller's time ran out while a probe was in flight: that
+                # is this read's timeout, not the probe's.
+                if deadline.passed():
+                    raise expired() from exc
+                raise
+            if found:
+                return {"value": value}
+            if deadline.passed():
+                raise expired()
+            time.sleep(deadline.slice(0.05))
 
     def op_text_content(self, params: Dict) -> Any:
-        return self._with_element(params, self.injected.text_content)
+        return self._read(params, "textContent")
 
     def op_inner_text(self, params: Dict) -> Any:
-        return self._with_element(params, self.injected.inner_text)
+        return self._read(params, "innerText")
 
     def op_inner_html(self, params: Dict) -> Any:
-        return self._with_element(params, self.injected.inner_html)
+        return self._read(params, "innerHTML")
 
     def op_input_value(self, params: Dict) -> Any:
-        return self._with_element(params, self.injected.input_value)
+        return self._read(params, "inputValue")
 
     def op_get_attribute(self, params: Dict) -> Any:
-        return self._with_element(params, lambda f, o: self.injected
-                                  .get_attribute(f, o,
-                                                 params["name"]))
+        return self._read(params, "attribute", params["name"])
 
-    def _state(self, params: Dict, state: str) -> Any:
-        return self._with_element(params, lambda f, o: self.injected
-                                  .element_state(f, o, state))
+    def _visibility(self, params: Dict, state: str) -> Any:
+        """`is_visible` / `is_hidden` answer NOW, as in Playwright: they do not
+        wait, and an element that is not there is not visible, and is hidden.
+        Until 0.34.1 a missing element raised "no element matches"."""
+        frame_id, selector = self.enter_frames(params["selector"])
+        found, value = self.injected.read_match(
+            frame_id, selector, "state", state,
+            strict=self._act_opts(params)["strict"])
+        return {"value": value if found else state == "hidden"}
 
     def op_is_visible(self, params: Dict) -> Any:
-        return self._state(params, "visible")
+        return self._visibility(params, "visible")
 
     def op_is_hidden(self, params: Dict) -> Any:
-        return self._state(params, "hidden")
+        return self._visibility(params, "hidden")
 
     def op_is_enabled(self, params: Dict) -> Any:
-        return self._state(params, "enabled")
+        return self._read(params, "state", "enabled")
 
     def op_is_disabled(self, params: Dict) -> Any:
-        return self._state(params, "disabled")
+        return self._read(params, "state", "disabled")
 
     def op_is_checked(self, params: Dict) -> Any:
-        return self._state(params, "checked")
+        return self._read(params, "state", "checked")
 
     def op_is_editable(self, params: Dict) -> Any:
-        return self._state(params, "editable")
+        return self._read(params, "state", "editable")
 
     def op_evaluate(self, params: Dict) -> Any:
-        """⛔ THE PAGE'S OWN WORLD, not the utility one, and the distinction
-        is the semantics of the API rather than a preference.
+        """⛔ THE CALLER'S WORLD, not the utility one, and the distinction is
+        the semantics of the API rather than a preference.
 
-        `page.evaluate()` is the user asking to run code AS THE PAGE: it must
-        see the page's globals, the page's prototypes, and whatever the site
-        has monkey-patched. The utility world sees the same DOM through an
-        Xray, so those are exactly what it does NOT see.
+        `page.evaluate()` is the user's code, and it must see what the page
+        added: its globals, its functions, the expandos a framework puts on
+        nodes. The utility world sees the same DOM through a plain Xray, so
+        those are exactly what it does NOT see. The caller's world (invisible-
+        core's `evaluate_in_caller`, [B322]) sees them, and resolves every
+        name the standard defines to the native definition: a site that
+        wrapped `querySelector` to count its callers does not see this code's
+        calls. Until firefox-49 this ran in the page's own realm, and a
+        Cloudflare challenge refused the clearance of a session whose evaluate
+        had looked up its token field.
 
         The first draft ran it in utility and it was caught by the opposite
         assertion to the one you would expect: a test checking that the PAGE
         cannot see a closed shadow root found that it could - because the code
         asking was not running as the page at all.
 
-        Everything else in this file stays in utility on purpose. This one
-        method leaves, because the caller asked for it.
+        Everything else in this file stays in utility on purpose. The
+        caller's code leaves it, because the caller asked for the page's
+        additions.
         """
-        return {"value": _serialize(self.injected.evaluate_in_main(
-            self.frame_id, _with_argument(params)))}
+        # ⛔ `repeatable` comes only from the fork's `evaluate_read`, a read
+        # its caller declares free of effects: made again on the page that
+        # replaced the one it went to. Everything else is the caller's code,
+        # sent once ([B285]).
+        def attempt(deadline=None):
+            return _remote_value(_run_callers_code(
+                self.injected, self.frame_id, params, by_value=True))
+        if params.get("repeatable") is True:
+            return {"value": _serialize(self.injected.in_current_world(
+                attempt, timeout=30.0))}
+        return {"value": _serialize(attempt())}
 
     # ── acting ──────────────────────────────────────────────────────────────
     # ⛔ frame-crossing selectors
@@ -903,8 +1147,8 @@ class FrameDispatcher(Dispatcher):
             frame = frame.page.frame_for(inner)
             selector = tail
 
-    def _timeout(self, params: Dict) -> float:
-        return (params.get("timeout") or 30000) / 1000.0
+    def _timeout(self, params: Dict) -> Optional[float]:
+        return _caller_timeout(params)
 
     def _pointer(self, params: Dict) -> Dict:
         """`button`, `modifiers` and `clickCount`, read in ONE place.
@@ -1122,14 +1366,15 @@ class FrameDispatcher(Dispatcher):
         return None
 
     def op_set_content(self, params: Dict) -> Any:
-        """⛔ Goes through `document.open/write/close` in the MAIN world.
+        """⛔ Goes through `document.open/write/close` in the CALLER'S world.
 
         The utility world has an EXTENDED principal, and Gecko requires
         `document.open()` to run under a principal EQUAL to the document's, so
         from there it answers `The operation is insecure` every single time -
-        the same defect the fork already fixed inside the driver.
+        the same defect the fork already fixed inside the driver. The caller's
+        world has the page's principal.
         """
-        self.injected.evaluate_in_main(
+        self.injected.evaluate_in_caller(
             self.frame_id,
             "(() => { document.open(); document.write(%s); document.close(); })()"
             % _js_string(params["html"]), by_value=True)
@@ -1178,13 +1423,77 @@ class FrameDispatcher(Dispatcher):
             self.server, self.page.frame_for(frame_id), object_id)
         return {"element": handle.channel}
 
+    def _call_on_elements(self, frame_id: str, elements: List[str],
+                          params: Dict, *, as_array: bool = False) -> Any:
+        """The caller's code on elements this server holds in the utility
+        world, run in the caller's world by `_run_callers_code` with the
+        elements as its receivers, or as ONE array of them (`as_array`, for
+        `eval_on_selector_all`). THE ONE PLACE element-scoped caller code
+        runs [B322].
+
+        `handle.evaluate`, `eval_on_selector` and `eval_on_selector_all` run
+        the caller's code as much as `evaluate` does, so they run where it
+        runs. Until firefox-49 they ran in the utility world, behind a plain
+        Xray, where what the page added to a node (`el.__vue__`, the methods
+        of a custom element's class) does not exist, while Playwright runs
+        them as the page. The elements cross with `Page.adoptNode` (the same
+        node, in the other world) and the copies are released after the call.
+        The caller's code is sent once ([B285]); finding the elements is this
+        package's read, made before it. The caller's code never sees this
+        package's script."""
+        context = self.injected.caller_context(frame_id)
+        adopted: List[str] = []
+        array: Optional[str] = None
+        try:
+            for element in elements:
+                copy = self.injected.node_to_caller(frame_id, element)
+                if not copy:
+                    raise ProtocolException("Element is not attached to the DOM")
+                adopted.append(copy)
+            receivers = adopted
+            if as_array:
+                array = self.injected.call_raw(
+                    context, _ARRAY, [{"objectId": a} for a in adopted],
+                    by_value=False)["objectId"]
+                receivers = [array]
+            return _remote_value(_run_callers_code(
+                self.injected, frame_id, params, receivers, by_value=True))
+        finally:
+            if array:
+                self.injected.release(context, array)
+            for copy in adopted:
+                self.injected.release(context, copy)
+
+    def _handle_from_caller(self, remote: Dict) -> "ElementHandleDispatcher":
+        """A handle for a value the CALLER'S code produced in its world.
+        THE ONE PLACE such a handle is made [B324].
+
+        A node is adopted into the utility world, where every element read and
+        action of this server runs - the same node, as `add_script_tag` and
+        `fileChooserOpened` hand theirs back - and its caller-world objectId is
+        released. Any other object, and a primitive, stays in the caller's
+        world, and its handle's operations run there. Until 0.36.0
+        `evaluate_handle` made every result a utility handle, and
+        `wait_for_function` one of the page's world that only `json_value`
+        honoured."""
+        object_id = remote.get("objectId")
+        if object_id and remote.get("subtype") == "node":
+            adopted = self.injected.adopt(self.frame_id, object_id)
+            if not adopted:
+                raise ProtocolException(
+                    "the node the expression returned could not be handed back")
+            self.injected.release(self.injected.caller_context(self.frame_id), object_id)
+            return ElementHandleDispatcher(self.server, self, adopted)
+        return ElementHandleDispatcher(self.server, self, object_id or "",
+                                       world="caller", remote=remote)
+
     def op_wait_for_function(self, params: Dict) -> Any:
         """Poll the CALLER'S expression until it is truthy.
 
-        ⛔ IN THE PAGE'S OWN WORLD, and it used to poll in the utility one.
+        ⛔ IN THE CALLER'S WORLD, and it used to poll in the utility one.
         `wait_for_function` has exactly the semantics of `evaluate`: it is the
-        caller asking to run THEIR code as the page. From behind the Xray a
-        page global does not exist, so an expression like
+        caller asking to run THEIR code against the page. From behind a plain
+        Xray a page global does not exist, so an expression like
         `() => !!window.Fingerprint` is false forever and the call dies on its
         own timeout naming an expression that was true in the page all along.
 
@@ -1193,56 +1502,228 @@ class FrameDispatcher(Dispatcher):
         Nothing else in the suite waits on a page global, which is why 181 of
         186 were green and the gap looked like a detector problem.
 
-        ⛔ AND IT IS THE SECOND METHOD THAT LEAVES THE XRAY, on purpose and
-        for the same reason as `op_evaluate`: everything else in this server
-        stays in utility so a site cannot count our reads, and these two leave
-        because the caller asked for the page's own world by name. The cost is
-        real - a polled expression is repeated page-visible work - so the
-        interval stays coarse.
+        ⛔ AND IT LEAVES THE UTILITY WORLD for the same reason as
+        `op_evaluate`, into the same caller's world, where the standard APIs
+        the predicate calls are the native ones ([B322]). What the predicate
+        reads of the page's own additions is still the page's, so the interval
+        stays coarse.
         """
-        deadline = time.monotonic() + self._timeout(params)
-        expression = _with_argument(params)
+        deadline = Deadline(self._timeout(params))
+        expression = params["expression"]
+        predicate = _Predicate(self.injected, self.frame_id, params)
         while True:
-            value = self.injected.evaluate_in_main(self.frame_id,
-                                                        expression)
-            if value:
+            # ⛔ A NAVIGATION DOES NOT END THE POLL. Each turn is one command
+            # (the caller's code is never sent twice, [B285]), and a world that
+            # went under it means the next turn evaluates the script in the new
+            # document, as Playwright's polling survives a navigation.
+            # ⛔ TRUTHY AS JAVASCRIPT JUDGES IT, from ONE run by reference
+            # (`_Predicate.turn`, [B323]). This used to run the predicate by value
+            # and let Python judge the serialized result, so a predicate that
+            # returns a node - `() => document.querySelector('#x')`, the most
+            # common wait there is - never ended: a node serializes to nothing
+            # truthy. A truthy value now IS the handle, and the caller's code
+            # no longer runs a second time to get one.
+            try:
+                remote = predicate.turn()
+            except ContextDestroyed:
+                remote = None
+            if remote is not None:
+                predicate.release()
                 # ⛔ A HANDLE, NEVER None. `_frame.py` wraps this reply in
                 # `from_channel(...)`, so answering None is not "no handle" -
                 # it is `AttributeError: 'NoneType' object has no attribute
                 # '_object'` raised inside the client on a call that had just
                 # succeeded. It stayed hidden while the poll timed out first.
-                object_id = self.injected.evaluate_in_main(
-                    self.frame_id, expression, by_value=False)
-                handle = ElementHandleDispatcher(
-                    self.server, self, object_id or "", world="main")
-                return {"handle": handle.channel}
-            if time.monotonic() > deadline:
-                raise ProtocolException(
+                return {"handle": self._handle_from_caller(remote).channel}
+            if deadline.passed():
+                predicate.release()
+                # A TimeoutError, which the client receives as Playwright's,
+                # as upstream raises for this wait (until 0.34.0 a plain Error).
+                raise TimeoutError(
                     "the expression never became truthy in %.0fs: %s"
                     % (self._timeout(params), expression[:120]))
             time.sleep(0.05)
 
     def op_expect(self, params: Dict) -> Any:
-        """⛔ The polling half of `expect()`. It answers ONE probe; the
-        retrying is the client's, in `_assertions.py`, which is why this must
-        not loop: looping here would multiply the caller's timeout by ours."""
+        """`expect(...)`: the condition polled until it holds, within the
+        caller's timeout, as Playwright's server does.
+
+        ⛔ UNTIL 0.34.1 NO `expect` ON A LOCATOR COULD PASS. This answered ONE
+        probe with `{matches, received}`, on the belief that the client
+        retries; the client of this fork does not (`_frame.py` `_expect`): it
+        sends once, takes a reply as success and an error carrying
+        `errorDetails` as failure, and its channel unwraps a one-key result,
+        so a two-key answer failed with an empty AssertionError. Every
+        `to_be_*` and `to_have_count` failed, whatever the page held
+        (2026-10-12). Polling is the server's, and so is the verdict:
+        `isNot` inverts it, and a condition that never held is
+        `ExpectNotMet` with the last value seen.
+
+        ⛔ AND WHAT IS POLLED IS PLAYWRIGHT'S OWN READING ([B328]). Until 0.38
+        this file re-wrote the conditions one by one, in Python, and had
+        written two families: `to.have.count` and the `to.be.*` states.
+        Everything else - `to_have_text`, `to_have_value`, `to_have_attribute`,
+        `to_have_class`, `to_be_in_viewport`, `to_have_title`, `to_have_url`,
+        `to_be_focused`, `to_be_empty`, `to_have_js_property`, `to_have_values`
+        and the rest - answered "is not implemented yet", and Playwright's own
+        suite was red on every one of them. The injected script this package
+        already ships carries Playwright's `expect`, every condition of it, so
+        the reading is that one function, called the way Playwright's server
+        calls it (`_expectInternal` in `frames.ts`), and there is no second
+        definition to fall behind. What stays here is what is the server's
+        there too: the polling, the strict check, and the verdict.
+
+        A JavaScript error in the reading - a strict-mode violation, a
+        `to_have_values` on something that is not a multiple select - ends the
+        wait at once and travels as the message, as upstream: it is not a
+        condition that a later page could make hold.
+        """
         expression = params.get("expression") or ""
         selector = params.get("selector")
-        try:
-            if expression.startswith("to.have.count"):
-                count = self.injected.count(self.frame_id, selector)
-                expected = int((params.get("expectedNumber") or 0))
-                return {"matches": count == expected,
-                        "received": _serialize(count)}
-            if expression.startswith("to.be."):
-                state = expression.split("to.be.", 1)[1]
-                return self._with_element(
-                    {"selector": selector},
-                    lambda f, o: None) and {"matches": True}
-        except ProtocolException:
-            return {"matches": False, "received": _serialize(None)}
-        raise ProtocolException(
-            "expect(%r) is not implemented yet" % expression)
+        is_not = bool(params.get("isNot"))
+        deadline = Deadline(self._timeout(params))
+        last: Optional[Dict] = None
+        # ⛔ THE CALL LOG, line for line where Playwright writes it ([B341]):
+        # the title and the timeout (its dispatcher), what is waited for
+        # (`frames.ts` `expect`), and each reading (`_expectInternal`). Until
+        # [B341] a failed expect said what was expected and what was seen, and
+        # nothing of the wait in between.
+        call = current_call()
+        call.log("%s%s" % (call.title, " with timeout %sms" % _js_number(params["timeout"])
+                           if params.get("timeout") else ""))
+        if selector:
+            call.log("waiting for " + self.injected.call(
+                self.frame_id,
+                "(injected, sel) => injected.utils.asLocator(injected._sdkLanguage, sel)",
+                selector))
+        while True:
+            try:
+                reading = self._expect_probe(expression, selector, params)
+            except ContextDestroyed:
+                # A navigation under the reading: the next turn asks the new
+                # document, as Playwright's polling survives one.
+                reading = None
+            except EvaluationError as e:
+                message = str(e).split("\n", 1)[0]
+                if message.startswith("Error: "):
+                    message = message[len("Error: "):]
+                raise ExpectNotMet(message, {"customErrorMessage": message},
+                                   call.lines)
+            if reading is not None:
+                for line in (reading.get("log"), reading.get("unexpected")):
+                    if line:
+                        call.log(line)
+                if reading["matches"] != is_not:
+                    return None
+                last = reading
+            if deadline.passed():
+                details: Dict[str, Any] = {"timedOut": True}
+                if last is not None:
+                    received: Dict[str, Any] = {}
+                    if "received" in last:
+                        received["value"] = _serialize(last["received"])
+                    if last.get("ariaSnapshot") is not None:
+                        received["ariaSnapshot"] = last["ariaSnapshot"]
+                    if received:
+                        details["received"] = received
+                    if last.get("missingReceived"):
+                        details["customErrorMessage"] = "element(s) not found"
+                raise ExpectNotMet(
+                    "expect(%s%s) did not hold within %dms"
+                    % ("not " if is_not else "", expression,
+                       round(deadline.seconds * 1000)),
+                    details, call.lines)
+            time.sleep(deadline.slice(0.1))
+
+    #: What Playwright's server hands the injected `expect` of the caller's
+    #: options. `expectedValue` is added parsed, as its dispatcher does.
+    _EXPECT_OPTIONS = ("expression", "expressionArg", "expectedText",
+                       "expectedNumber", "useInnerText", "isNot", "selector")
+
+    #: One reading, as `_expectInternal` makes it: every element the selector
+    #: matches, refused when a single-element condition matches more than one,
+    #: and the first match handed to the injected script's `expect`.
+    #: ⛔ `to.have.property` reads THE PAGE'S property: upstream sends that one
+    #: condition to the main world, where the page's own expandos live. From
+    #: this world the same object is `wrappedJSObject`, the page's view of the
+    #: node, and every other condition stays on the native one.
+    _EXPECT = (
+        "async (injected, sel, options) => {"
+        "  let elements = [];"
+        "  let log = '';"
+        "  if (sel !== null) {"
+        "    const parsed = injected.parseSelector(sel);"
+        "    elements = injected.querySelectorAll(parsed, document);"
+        "    const isArray = options.expression === 'to.have.count'"
+        "        || options.expression.endsWith('.array');"
+        "    if (isArray)"
+        "      log = `  locator resolved to ${elements.length} element${elements.length === 1 ? '' : 's'}`;"
+        "    else if (elements.length > 1)"
+        "      throw injected.strictModeViolationError(parsed, elements);"
+        "    else if (elements.length)"
+        "      log = `  locator resolved to ${injected.previewNode(elements[0])}`;"
+        "  }"
+        "  let element = elements[0];"
+        "  if (options.expression === 'to.have.property' && element"
+        "      && element.wrappedJSObject)"
+        "    element = element.wrappedJSObject;"
+        "  const r = await injected.expect(element, options, elements);"
+        "  const out = { matches: !!r.matches,"
+        "                missingReceived: !!r.missingReceived, log };"
+        "  const value = r.received ? r.received.value : undefined;"
+        "  if (!!r.matches === !!options.isNot && !r.missingReceived"
+        "      && !Array.isArray(value))"
+        "    out.unexpected = `  unexpected value \"${value}\"`;"
+        "  if (r.received) {"
+        "    out.received = r.received.value === undefined ? null : r.received.value;"
+        "    if (r.received.ariaSnapshot !== undefined)"
+        "      out.ariaSnapshot = r.received.ariaSnapshot;"
+        "  }"
+        "  return out; }")
+
+    @staticmethod
+    def _structured(argument: Any) -> bool:
+        """Whether Playwright's serialized argument is an object, an array, a
+        date, a regular expression, a URL, an error, a typed array or a handle:
+        anything that is not a primitive."""
+        value = argument.get("value") if isinstance(argument, dict) else None
+        return isinstance(value, dict) and any(
+            tag in value for tag in ("o", "a", "d", "r", "u", "e", "ta", "h"))
+
+    def _expect_probe(self, expression: str, selector: Optional[str],
+                      params: Dict) -> Dict:
+        """One reading of an expect condition, on the page as it is NOW:
+        `{matches, received?, ariaSnapshot?, missingReceived}`.
+
+        ⛔ `to.match.aria` IS REFUSED BY NAME: its template is YAML that
+        Playwright's server parses into a tree before the injected script sees
+        it, and this server has no parser for it. Saying so is the honest
+        answer; matching an unparsed string would be a verdict on nothing."""
+        if expression == "to.match.aria":
+            raise ProtocolException(
+                "expect('to.match.aria') is not implemented yet: the template is "
+                "YAML that Playwright's server parses, and this one has no parser "
+                "for it")
+        if expression == "to.have.property" and self._structured(params.get("expectedValue")):
+            # ⛔ A FALSE "DIFFERENT" IS WORSE THAN A REFUSAL. Upstream compares in
+            # the page's own realm; here the page's value is read from the
+            # utility world, and Playwright's `deepEquals` refuses two objects
+            # whose constructors are not the same one, which across realms they
+            # never are. A primitive compares by value and is answered.
+            raise ProtocolException(
+                "expect('to.have.property') with an object, an array or a date "
+                "as the expected value is not implemented yet: the page's value "
+                "lives in another realm, and comparing it would always say it "
+                "differs. A primitive value is compared.")
+        if selector:
+            frame_id, sel = self.enter_frames(selector)
+        else:
+            frame_id, sel = self.frame_id, None
+        options = {k: params[k] for k in self._EXPECT_OPTIONS if k in params}
+        if params.get("expectedValue") is not None:
+            options["expectedValue"] = _deserialize(params["expectedValue"])
+        return self.injected.call(frame_id, self._EXPECT, sel, options) or {
+            "matches": False, "missingReceived": True}
 
     def op_aria_snapshot(self, params: Dict) -> Any:
         """The accessibility tree, as the injected script builds it.
@@ -1255,12 +1736,8 @@ class FrameDispatcher(Dispatcher):
         """
         selector = params.get("selector")
         if selector:
-            return self._with_element(
-                params,
-                lambda f, o: self.injected.call(
-                    f,
-                    "(injected, el, o) => injected.ariaSnapshot(el, o)",
-                    {"objectId": o}, {"mode": params.get("mode") or "raw"}))
+            return self._read(params, "ariaSnapshot",
+                              {"mode": params.get("mode") or "raw"})
         return {"snapshot": self.injected.call(
             self.frame_id,
             "(injected, o) => injected.ariaSnapshot(document.documentElement, o)",
@@ -1389,11 +1866,11 @@ class FrameDispatcher(Dispatcher):
                 "  (document.head || document.documentElement).appendChild(el);"
                 "  return el; })()" % (build, _js_string(content)))
 
-        object_id = self.injected.evaluate_in_main(
+        object_id = self.injected.evaluate_in_caller(
             self.frame_id, body, by_value=False)
-        # ⛔ THE TAG IS BORN IN THE MAIN WORLD AND THE HANDLE LIVES IN UTILITY.
-        # Every ElementHandle call goes through the utility world, where a
-        # main-world objectId answers `Cannot find object with id`. Adopted,
+        # ⛔ THE TAG IS BORN IN THE CALLER'S WORLD AND THE HANDLE LIVES IN
+        # UTILITY. Every ElementHandle call goes through the utility world,
+        # where a caller-world objectId answers `Cannot find object with id`. Adopted,
         # as `fileChooserOpened` adopts its input, it is the same node.
         adopted = self.injected.adopt(self.frame_id, object_id)
         if not adopted:
@@ -1433,26 +1910,53 @@ class FrameDispatcher(Dispatcher):
         return {"elements": [h.channel for h in handles]}
 
     def op_eval_on_selector(self, params: Dict) -> Any:
-        return self._with_element(
-            params,
-            lambda f, o: _serialize(self.injected.call(
-                f, _element_function(params), {"objectId": o})))
+        """`page.eval_on_selector`: ONE attempt, as Playwright's `$eval`. It
+        does not wait, and an element that is not there is an error; a frame
+        that navigates between the query and the call is `ContextDestroyed`,
+        which says so in Playwright's words."""
+        frame_id, selector = self.enter_frames(params["selector"])
+        object_id = self.injected.query_selector(frame_id, selector)
+        if not object_id:
+            raise ProtocolException(
+                "failed to find element matching selector %r" % selector)
+        try:
+            return {"value": _serialize(self._call_on_elements(
+                frame_id, [object_id], params))}
+        finally:
+            self.injected.dispose(frame_id, object_id)
+
+    def op_read_all(self, params: Dict) -> Any:
+        """`locator.all_inner_texts()` and `all_text_contents()`: a read of
+        every match, in one command of values, made again on the page that
+        replaced the one it went to ([B282]). The fork's client asks for them
+        here and not through `evalOnSelectorAll`, which carries the caller's
+        code and sends it once ([B285]); upstream's client sends a fixed
+        function through that door, and nothing on this side can tell it from
+        a caller's."""
+        what = params.get("what")
+        if what not in ("innerText", "textContent"):
+            raise ProtocolException(
+                "readAll reads innerText or textContent, not %r" % what)
+        frame_id, selector = self.enter_frames(params["selector"])
+        return {"value": self.injected.read_all(frame_id, selector, what)}
 
     def op_eval_on_selector_all(self, params: Dict) -> Any:
+        """`page.eval_on_selector_all`: the caller's function, sent ONCE. A
+        frame that navigates under it is `ContextDestroyed`, as Playwright
+        raises; sending it again ran it twice ([B285])."""
         frame_id, selector = self.enter_frames(params["selector"])
-        value = self.injected.call(
-            frame_id,
-            "(injected, sel) => { const els = injected.querySelectorAll("
-            "  injected.parseSelector(sel), document); %s }"
-            % _called_on(params, "els"),
-            selector)
-        return {"value": _serialize(value)}
+        ids = self.injected.query_selector_all(frame_id, selector)
+        try:
+            return {"value": _serialize(self._call_on_elements(
+                frame_id, ids, params, as_array=True))}
+        finally:
+            for object_id in ids:
+                self.injected.dispose(frame_id, object_id)
 
     def op_evaluate_handle(self, params: Dict) -> Any:
-        object_id = self.injected.evaluate_in_main(
-            self.frame_id, _with_argument(params), by_value=False)
-        handle = ElementHandleDispatcher(self.server, self, object_id)
-        return {"handle": handle.channel}
+        remote = _run_callers_code(self.injected, self.frame_id, params,
+                                   by_value=False)
+        return {"handle": self._handle_from_caller(remote).channel}
 
 
 # ⛔ `DialogDispatcher` LIVED HERE AND IS GONE, fused into `_pw._impl._dialog`
@@ -1485,6 +1989,10 @@ class RequestDispatcher(Dispatcher):
         #: heuristic - which is what makes `PageDispatcher.navigation_response`
         #: able to answer `goto` with the response of the document it loaded.
         self.navigation_id = params.get("navigationId")
+        #: Where the request went: the URL it was sent with, until a route
+        #: sends it on somewhere else (`continued_at`). Its response is that
+        #: URL's, as Playwright's server has it.
+        self.url = params.get("url") or ""
         self.raw_headers = _headers_array(params.get("headers"))
         self.response: Optional["ResponseDispatcher"] = None
         #: Filled by `Network.requestFailed`. ⛔ None until it fails: an
@@ -1493,7 +2001,7 @@ class RequestDispatcher(Dispatcher):
         self.failure: Optional[str] = None
         frame_id = params.get("frameId") or page.frame.frame_id
         super().__init__(server, page, {
-            "url": params.get("url") or "",
+            "url": self.url,
             "method": params.get("method") or "GET",
             "headers": self.raw_headers,
             # ⛔ OMITTED WHEN ABSENT, never sent as null. The client reads
@@ -1502,13 +2010,13 @@ class RequestDispatcher(Dispatcher):
             # corruption tomorrow; the driver omits the key entirely and this
             # matches it.
             #
-            # ⛔ THE ENGINE SENDS IT ONLY WHILE A ROUTE IS SET on the page or
-            # its context. A stealth patch dated 2026-08-24 stopped reading
-            # the body of every POST; through firefox-35 that left
-            # `request.post_data` None for every POST, inside a route guard
-            # too (feder-cr/invisible_core#90). Engines carrying the fix read
-            # it again while interception is on, so a route handler and the
-            # `request` event see the body then, and None without a route.
+            # ⛔ WHICH ENGINE SENDS IT. A stealth patch dated 2026-08-24
+            # stopped reading the body of every POST; through firefox-35 that
+            # left `request.post_data` None for every POST, inside a route
+            # guard too (feder-cr/invisible_core#90). From firefox-36 to
+            # firefox-48 the engine read it only while interception was on, so
+            # without a route it was None, like a form sent empty. From
+            # firefox-49 it reads every body up to 10 MB, as upstream's does.
             # It is recorded here because this is where somebody will come
             # looking.
             **({"postData": params["postData"]}
@@ -1532,6 +2040,21 @@ class RequestDispatcher(Dispatcher):
         if index.get(self.navigation_id) is self:
             del index[self.navigation_id]
         super().dispose(reason)
+
+    def continued_at(self, url: str) -> None:
+        """A route sent this request on to `url`.
+
+        ⛔ THE ENGINE SAYS NOTHING OF IT: it applies a route's URL as an
+        internal redirect, as upstream's does, so this is the one place that
+        knows. Two things follow from it, and both are told here: the
+        response is `url`'s (Playwright's server answers `response.url` with
+        the overridden URL), and a navigation's document went to `url`, which
+        is where the lifecycle judges its commit. Until this, a
+        `route.fallback(url=...)` on a navigation made `goto` refuse the page
+        the route had sent it to (B326)."""
+        self.url = url
+        if self.navigation_id:
+            self.page.lifecycle.went_to(self.navigation_id, url)
 
     def op_response(self, params: Dict) -> Any:
         return {"response": self.response.channel if self.response else None}
@@ -1565,6 +2088,9 @@ class ResponseDispatcher(Dispatcher):
         self.protocol_version = params.get("protocolVersion") or ""
         self.remote = {"ipAddress": params.get("remoteIPAddress") or "",
                        "port": params.get("remotePort") or 0}
+        # The certificate the engine read off the channel, or None for a
+        # response that did not come over TLS.
+        self.security_details = params.get("securityDetails") or None
         # ⛔ The parent is the REQUEST, which is where the driver puts it.
         # Unlike the ElementHandle case this one is not load-bearing today -
         # `_network.py` reads its request from the INITIALIZER, not from the
@@ -1572,7 +2098,7 @@ class ResponseDispatcher(Dispatcher):
         # and a response outliving its request is not a shape anybody has
         # thought about. Matching the driver costs one word.
         super().__init__(server, request, {
-            "url": request.initializer["url"],
+            "url": request.url,
             "status": params.get("status") or 0,
             "statusText": params.get("statusText") or "",
             "headers": self.raw_headers,
@@ -1657,7 +2183,13 @@ class ResponseDispatcher(Dispatcher):
         return {"value": self.protocol_version or "unknown"}
 
     def op_security_details(self, params: Dict) -> Any:
-        return {"value": None}
+        """⛔ THIS ANSWERED None FOR EVERY RESPONSE, HTTPS INCLUDED, which a
+        script reads as "not over TLS": a value, not a refusal. The engine sent
+        `securityDetails: null` from 2026-08-24 through firefox-48, and this
+        answer was written against that. The engine after firefox-48 reports
+        the certificate as upstream does; this hands on whatever the engine
+        sent, so an engine that still sends null answers None, as before."""
+        return {"value": self.security_details}
 
     def op_server_addr(self, params: Dict) -> Any:
         return {"value": self.remote if self.remote["ipAddress"] else None}
@@ -1731,9 +2263,15 @@ class RouteDispatcher(Dispatcher):
         """⛔ The error code travels: `NS_ERROR_ABORT` and `NS_ERROR_FAILURE`
         are not the same thing to a page that inspects the failure, and
         collapsing every reason into one is the sort of flattening a detector
-        can read."""
+        can read.
+
+        ⛔ AND A `route.abort()` WITH NO CODE IS "failed", as Playwright's own
+        server has it (`errorCode || "failed"`), which the engine turns into
+        `NS_ERROR_FAILURE`. This defaulted to "aborted", so the navigation
+        failed with `NS_ERROR_ABORT` where Playwright's Firefox says
+        `NS_ERROR_FAILURE` (B325)."""
         return self._send("Network.abortInterceptedRequest",
-                          {"errorCode": params.get("errorCode") or "aborted"})
+                          {"errorCode": params.get("errorCode") or "failed"})
 
     def op_continue(self, params: Dict) -> Any:
         payload = only_set({
@@ -1743,6 +2281,10 @@ class RouteDispatcher(Dispatcher):
                        if params.get("headers") is not None else None,
             "postData": params.get("postData"),
         })
+        # Before the command, not after: the document may commit before its
+        # reply is read, and the lifecycle judges the commit by this.
+        if params.get("url"):
+            self.request.continued_at(params["url"])
         return self._send("Network.resumeInterceptedRequest", payload)
 
     def op_fulfill(self, params: Dict) -> Any:
@@ -1843,7 +2385,9 @@ class PageDispatcher(Dispatcher):
         # (`op_close`, the reader's detach, an adoption finishing early, a
         # context closing underfoot) and check-then-set without it emits
         # `close` twice when the two interleave between the test and the set.
-        self._close_lock = threading.Lock()
+        # Re-entrant: it is also the gate of this page's events (`_deliver`),
+        # and an event whose handling ends the page closes it from inside.
+        self._close_lock = threading.RLock()
         self._announced_closed = False
         # The id Juggler gave the running screencast, or None. One per page,
         # because the engine holds one capture sink per window.
@@ -2010,7 +2554,7 @@ class PageDispatcher(Dispatcher):
             for i, (method, params) in enumerate(held):
                 if last[id(params)] == i and method.startswith("Network."):
                     try:
-                        self._on_juggler_event(method, params)
+                        self._deliver(method, params)
                     except Exception:
                         pass
         self._hear_lifecycle()
@@ -2031,6 +2575,27 @@ class PageDispatcher(Dispatcher):
 
     def _on_lifecycle(self, what: str, frame_id: str,
                       url: Optional[str] = None) -> None:
+        # ⛔ THE CLIENT'S FRAMES COME FROM HERE ALONE. The lifecycle owns the
+        # frame tree: it says a frame is born when its id is new, and gone when
+        # it detaches or its parent's new document replaces it. Until 0.34.1
+        # this page answered the engine's raw `frameAttached`/`frameDetached`
+        # itself, so the main frame re-announced by every cross-process
+        # navigation was announced to the client again, and an iframe whose
+        # parent moved away was never retired: after six navigations
+        # `page.frames` held eight entries for two frames (2026-10-12).
+        if what == "frameDetached":
+            child = self._frames.pop(frame_id, None)
+            if child is not None:
+                self.emit("frameDetached", {"frame": child.channel})
+                child.dispose()
+            return
+        if what == "frameAttached":
+            # Never the main frame: the lifecycle announces an id it sees for
+            # the first time, and this page is built after its main frame was
+            # seen (`wait_for_main_frame`); the initializer carries it.
+            child = self.frame_for(frame_id)
+            self.emit("frameAttached", {"frame": child.channel})
+            return
         child = self.frame_for(frame_id)
         if what == "networkidle":
             child.emit("loadstate", {"add": "networkidle"})
@@ -2075,7 +2640,30 @@ class PageDispatcher(Dispatcher):
                     if len(self._held) < self.HELD_CAP:
                         self._held.append((method, params))
                     return
-        self._on_juggler_event(method, params)
+        self._deliver(method, params)
+
+    def _deliver(self, method: str, params: Dict) -> None:
+        """Hand one event of this page's session to its handler: the ONE way in,
+        for the live events and for the ones held at birth.
+
+        ⛔ UNDER THE CLOSE'S OWN LOCK, AND NOTHING ONCE THE PAGE IS CLOSED. The
+        close (`announce_closed`) runs on the caller's thread or on the
+        engine's detach, the events on the reader thread, and the two were not
+        serialized: the reader could be inside this page's handler, or enter
+        it, after the client had been sent `close` and `__dispose__`. A
+        `Network.responseReceived` then created a Response under a request the
+        client had dropped with its page, and the context's `response` event
+        named an object the client never built, so the client threw
+        `'dict' object has no attribute '_object'` (3 runs out of 4 of 150
+        open-and-close cycles, measured 2026-10-15). Taken here, an event being
+        handled finishes before the close is announced, and an event after it
+        reaches nothing: for the client the page and everything under it are
+        gone.
+        """
+        with self._close_lock:
+            if self._announced_closed:
+                return
+            self._on_juggler_event(method, params)
 
     def _detach_listeners(self) -> None:
         """Unsubscribe this page and everything it owns.
@@ -2172,20 +2760,12 @@ class PageDispatcher(Dispatcher):
                 daemon=True).start()
         elif method == "Page.crashed":
             self.emit("crash")
-        elif method == "Page.frameAttached":
-            # ⛔ A CHILD FRAME HAS TO BE ANNOUNCED, or `page.frames` holds only
-            # the main one and every iframe locator finds nothing. The judge
-            # caught this: seven tests passed through the Node driver and failed
-            # through us, all of them about frames, and the message was
-            # `page.frames urls = ['http://.../']` - one entry where there
-            # should have been two.
-            child = self.frame_for(params["frameId"])
-            self.emit("frameAttached", {"frame": child.channel})
-        elif method == "Page.frameDetached":
-            child = self._frames.pop(params.get("frameId"), None)
-            if child is not None:
-                self.emit("frameDetached", {"frame": child.channel})
-                child.dispose()
+        # ⛔ `Page.frameAttached` / `Page.frameDetached` ARE NOT READ HERE: the
+        # client hears a frame from `_on_lifecycle`, which the lifecycle calls
+        # when a frame is really born or really gone. A child frame still has
+        # to be announced, or `page.frames` holds only the main one and every
+        # iframe locator finds nothing (the judge caught that once: seven
+        # frame tests passed through the Node driver and failed through us).
         elif method == "Page.eventFired":
             state = {"load": "load",
                      "DOMContentLoaded": "domcontentloaded"}.get(
@@ -2195,6 +2775,17 @@ class PageDispatcher(Dispatcher):
                 # reaches `load` leaves a wait on it hanging forever.
                 self.frame_for(params["frameId"]).emit(
                     "loadstate", {"add": state})
+        elif (method.startswith("Network.")
+              and self.lifecycle.favicons.is_favicon(params.get("requestId"))):
+            # The browser's own favicon request, as Playwright treats it
+            # (`invisible_core.juggler.favicon`): no event reaches the client
+            # and no route handler sees it. Held by a route, it goes on to the
+            # network instead of being aborted, as from any Firefox.
+            # ⛔ ASKED, NOT KEPT: the lifecycle read this event first and holds
+            # the session's one memory of it, so this page and the lifecycle
+            # cannot disagree about a request, a redirect or a replay.
+            if method == "Network.requestWillBeSent" and params.get("isIntercepted"):
+                self._let_through(params.get("requestId"))
         elif method == "Network.requestWillBeSent":
             request = RequestDispatcher(self.server, self, params)
             self._requests[params.get("requestId")] = request
@@ -2413,28 +3004,49 @@ class PageDispatcher(Dispatcher):
         elif self.context.intercepting:
             owner = self.context
         else:
-            # ⛔ The engine may have released it already: turning the PAGE's
-            # interception off resumes every request it holds, so this answer
-            # can find nothing and say "Cannot find request". Turning the
-            # CONTEXT's off releases nothing, which is the case this is for.
-            try:
-                self.send("Network.resumeInterceptedRequest",
-                          {"requestId": request.request_id})
-            except (juggler.ProtocolError, juggler.TargetClosedError):
-                pass
+            self._let_through(request.request_id)
             return
         route = RouteDispatcher(self.server, request)
         owner.emit("route", {"route": route.channel, "page": self.channel})
 
-    def send(self, command: str, params: Dict) -> Any:
+    def _let_through(self, request_id: str) -> None:
+        """Release a held request to the network, unchanged.
+
+        Two requests come here: one held while the context's interception was
+        switched off (turning the CONTEXT's off releases nothing), and the
+        favicon, which no handler may see.
+
+        ⛔ POSTED, NOT SENT. This runs inside the handler of the request's own
+        event, on the reader thread, and `send` waits for a reply only that
+        thread can read: a deadlock (`Connection.post`). Measured 2026-10-17
+        the moment the favicon came here: the page's next `evaluate` waited
+        30 s for an answer behind it. The context branch had the same `send`
+        from the same thread, unnoticed only because that path is rare. An
+        error reply is dropped with the rest, which is what this wants: the
+        engine may have released the request already (turning the PAGE's
+        interception off resumes every request it holds) and say "Cannot find
+        request".
+        """
+        self.conn.post("Network.resumeInterceptedRequest",
+                       {"requestId": request_id}, session=self.session)
+
+    def send(self, command: str, params: Dict,
+             timeout: Optional[float] = None) -> Any:
         """A Juggler command on THIS page's session.
 
         ⛔ The session is not optional and it is not a detail: without it the
         command lands on whichever page the browser feels like, and with two
         pages open the events of one are indistinguishable from the other.
+
+        ⛔ `timeout` IS THE CALLER'S, or none. Until 0.34.0 every command here
+        had 30 s of its own, which is shorter than a `screenshot(timeout=)`
+        the caller lengthened and is a bound Playwright does not have at all
+        on the rest (viewport, media, bring_to_front, screencast, dialogs).
+        Without one the reply still ends: the engine answers, or the pipe
+        closes and the connection raises TargetClosedError at once.
         """
-        return self.conn.send(command, params,
-                                              session=self.session, timeout=30)
+        return self.conn.send(command, params, session=self.session,
+                              timeout=timeout)
 
     async def send_async(self, command: str, params: Dict) -> Any:
         """`send`, off the loop and awaitable.
@@ -2503,12 +3115,14 @@ class PageDispatcher(Dispatcher):
         the recorded trace exists to stop.
         """
         frame_id = self.frame.frame_id
-        # ⛔ READ THE CURRENT NAVIGATION FIRST. History gives back no
-        # navigationId, so the only thing to anchor the wait on is that this
-        # one has changed - and reading it after the command would sometimes
-        # read the new one.
-        frame = self.lifecycle.frame(frame_id)
-        previous = frame.navigation if frame is not None else None
+        # ⛔ THE MARK IS TAKEN FIRST. History gives back no navigationId, so
+        # the only thing to anchor the wait on is that the frame has moved -
+        # and reading it after the command would sometimes read the new one.
+        # The mark holds the same-document count too: going to a hash or
+        # `pushState` entry starts no navigation, and until 0.35.2 `go_back`
+        # to one waited out its timeout and raised where Playwright answers
+        # null at once ([B290]).
+        since = self.lifecycle.mark(frame_id)
         result = self.send(command, {"frameId": frame_id}
                            if command != "Page.reload" else {}) or {}
         if command != "Page.reload" and not result.get("success"):
@@ -2523,8 +3137,8 @@ class PageDispatcher(Dispatcher):
         # `reload` answer with a Response like `goto` does: the same [B200],
         # which would otherwise be reopened here in a month.
         navigation = self.lifecycle.wait_for_new_navigation(
-            frame_id, previous, params.get("waitUntil") or "load",
-            timeout=(params.get("timeout") or 30000) / 1000.0)
+            frame_id, since, params.get("waitUntil") or "load",
+            timeout=_caller_timeout(params))
         return {"response": self.navigation_response(navigation)}
 
     def op_go_back(self, params: Dict) -> Any:
@@ -2674,7 +3288,7 @@ class PageDispatcher(Dispatcher):
             "clip": clip,
             "quality": params.get("quality"),
             "omitDeviceScaleFactor": False,
-        })) or {}
+        }), timeout=self.frame._timeout(params)) or {}
         # ⛔ BASE64 IN, BASE64 OUT. The client decodes it; decoding here and
         # handing back bytes puts a str() of a bytes object in the answer.
         return {"binary": result.get("data")}
@@ -2685,7 +3299,7 @@ class PageDispatcher(Dispatcher):
         once used as a "bare command" to measure transport latency and reported
         26,8 ms of browser work as if it were ours. It is the right command
         here, and the wrong one to benchmark with."""
-        self.conn.send("Heap.collectGarbage", {}, timeout=30)
+        self.conn.send("Heap.collectGarbage", {}, timeout=None)
         return None
 
     def op_add_script_tag(self, params: Dict) -> Any:
@@ -2712,8 +3326,9 @@ class PageDispatcher(Dispatcher):
     def _storage(self, params: Dict, code: str, *args) -> Any:
         """localStorage or sessionStorage, in the PAGE's own world.
 
-        ⛔ THE MAIN WORLD, and this one is not a style choice: web storage is
-        keyed by ORIGIN and the utility world sandbox has an ExpandedPrincipal.
+        ⛔ THE CALLER'S WORLD, and this one is not a style choice: web storage
+        is keyed by ORIGIN and the utility world sandbox has an ExpandedPrincipal,
+        while the caller's world has the page's principal.
         Reading it from there does not raise - it answers a DIFFERENT store,
         empty, and the caller concludes the site saved nothing.
 
@@ -2726,7 +3341,7 @@ class PageDispatcher(Dispatcher):
             raise ProtocolException(
                 "unknown storage kind %r: the two are localStorage and "
                 "sessionStorage" % kind)
-        return self.injected.evaluate_in_main(
+        return self.injected.evaluate_in_caller(
             self.frame.frame_id, code % ((kind,) + args))
 
     def op_storage_items(self, params: Dict) -> Any:
@@ -2794,7 +3409,7 @@ class PageDispatcher(Dispatcher):
             self.conn.send(
                 "Page.setInterceptFileChooserDialog",
                 {"enabled": bool(params.get("enabled"))},
-                session=self.session, timeout=10)
+                session=self.session, timeout=None)
         return None
 
     def op_run_before_unload(self, params: Dict) -> Any:
@@ -2802,7 +3417,7 @@ class PageDispatcher(Dispatcher):
         `beforeunload` dialog. Answering it is the CALLER's job through the
         dialog event, so this must not close the page itself - doing that
         would dismiss the very dialog the option exists to raise."""
-        self.injected.evaluate_in_main(self.frame.frame_id, "window.close()")
+        self.injected.evaluate_in_caller(self.frame.frame_id, "window.close()")
         return None
 
     def op_touchscreen_tap(self, params: Dict) -> Any:
@@ -2962,7 +3577,7 @@ class PageDispatcher(Dispatcher):
         try:
             self.conn.send(
                 "Page.close", {"runBeforeUnload": False},
-                session=self.session, timeout=10)
+                session=self.session, timeout=None)
         except Exception:
             pass
         # ⛔ The session, the context's list and the browser's target map are
@@ -3218,17 +3833,29 @@ class BrowserContextDispatcher(Dispatcher):
                 "(pageNumber), reserved by the client at the call; got %r"
                 % (number,))
         browser = self.browser
+        # ⛔ NO BOUND OF ITS OWN on the engine's reply (issue #321). Playwright's
+        # newPage carries no timeout, so the only bound that means anything is
+        # the caller's: a navigation that opens the page, an MCP tool call. A
+        # constant here was shorter than those, and on a loaded host, the
+        # first page after a slow launch failed at 31 s while the navigation
+        # that asked for it still had time (5 such failures in 773 page calls
+        # of a real audit, each one loading normally when repeated). The
+        # reply still ends in one of two ways: the engine answers, or the pipe
+        # closes and the connection raises TargetClosedError at once.
         with browser._asking(self.context_id) as answered:
             result = self.conn.send("Browser.newPage",
-                                    _address(self.context_id, {}), timeout=30)
+                                    _address(self.context_id, {}), timeout=None)
             answered(result["targetId"], number)
         page = browser._wait_for_page(result["targetId"], timeout=60.0)
         return {"page": page.channel}
 
     # ── cookies, permissions, geolocation ───────────────────────────────────
     def _browser_send(self, command: str, params: Dict) -> Any:
+        """A `Browser.*` command about this context, for calls Playwright
+        gives no timeout (cookies, permissions, geolocation, init scripts,
+        routes): without a bound of its own, as `op_new_context` says."""
         return self.conn.send(command, _address(self.context_id, params),
-                              timeout=30)
+                              timeout=None)
 
     def op_add_cookies(self, params: Dict) -> Any:
         """⛔ `expires` IS SECONDS AND -1 MEANS SESSION, not zero and not
@@ -3319,7 +3946,7 @@ class BrowserContextDispatcher(Dispatcher):
         try:
             self.conn.send("Browser.removeBrowserContext",
                                    {"browserContextId": self.context_id},
-                                   timeout=10)
+                                   timeout=None)
         except Exception:
             pass
         # ⛔ THE PAGES ARE TOLD FIRST, and this was missing entirely.
@@ -3455,8 +4082,10 @@ class BrowserDispatcher(Dispatcher):
         # recording earlier can only shorten the window in which `session_for`
         # is waiting for something that has already arrived.
         conn.add_listener(self._route_browser_event)
-        conn.send("Browser.enable", {"attachToDefaultContext": True},
-                  timeout=30)
+        # The last step of starting the browser, under what is left of the
+        # caller's `launch(timeout=)` (`Connection.startup_send`), not a
+        # bound of its own: until 0.34.0 it had 30 s whatever the caller said.
+        conn.startup_send("Browser.enable", {"attachToDefaultContext": True})
         super().__init__(server, browser_type,
                          {"version": version, "name": "firefox",
                           "browserName": "firefox"})
@@ -3840,14 +4469,20 @@ class BrowserDispatcher(Dispatcher):
     )
 
     def op_new_context(self, params: Dict) -> Any:
+        # ⛔ NO BOUND OF ITS OWN, on this or on any option below, for the
+        # reason `op_new_page` gives (#321): Playwright's newContext carries no
+        # timeout, and the first context of a session is created in the same
+        # seconds after the launch when a loaded host answers slowest. Every
+        # reply still ends: the engine answers, or the pipe closes and the
+        # connection raises TargetClosedError at once.
         result = self.conn.send("Browser.createBrowserContext",
-                                {"removeOnDetach": True}, timeout=30)
+                                {"removeOnDetach": True}, timeout=None)
         context_id = result["browserContextId"]
         try:
             self._apply_context_options(context_id, params)
         except BaseException:
             self.conn.send("Browser.removeBrowserContext",
-                           {"browserContextId": context_id}, timeout=30)
+                           {"browserContextId": context_id}, timeout=None)
             raise
         context = BrowserContextDispatcher(self.server, self, params,
                                            context_id)
@@ -3886,7 +4521,7 @@ class BrowserDispatcher(Dispatcher):
         # reading the text of an error.
         if params.get("serviceWorkers") == "block":
             self._context_send("Browser.setServiceWorkersBlocked", {
-                "browserContextId": context_id, "blocked": True}, timeout=30)
+                "browserContextId": context_id, "blocked": True})
         for name, command, field in self.ENGINE_OPTIONS:
             value = params.get(name)
             if value in (None, ""):
@@ -3911,8 +4546,7 @@ class BrowserDispatcher(Dispatcher):
                 # from the egress, and this side does not know the proxy.
                 value = SessionLocale.of(value).accept_languages
             self._context_send(command,
-                           {"browserContextId": context_id, field: value},
-                           timeout=10)
+                           {"browserContextId": context_id, field: value})
         # ⛔ The rest of the option set, each one a lever that was arriving
         # and going nowhere. They are grouped here rather than spread through
         # the dispatcher because they share one property: the client sends them
@@ -3929,35 +4563,34 @@ class BrowserDispatcher(Dispatcher):
                 raise ProtocolException(
                     "new_context(proxy=...) cannot be applied: %s" % exc)
             self._context_send("Browser.setContextProxy",
-                           dict(proxy, browserContextId=context_id),
-                           timeout=10)
+                           dict(proxy, browserContextId=context_id))
         headers = params.get("extraHTTPHeaders")
         if headers:
             self._context_send("Browser.setExtraHTTPHeaders",
                            {"browserContextId": context_id,
-                            "headers": headers}, timeout=10)
+                            "headers": headers})
         if params.get("offline"):
             self._context_send("Browser.setOnlineOverride",
                            {"browserContextId": context_id,
-                            "override": "offline"}, timeout=10)
+                            "override": "offline"})
         geolocation = params.get("geolocation")
         if geolocation:
             self._context_send("Browser.setGeolocationOverride",
                            {"browserContextId": context_id,
-                            "geolocation": geolocation}, timeout=10)
+                            "geolocation": geolocation})
         credentials = params.get("httpCredentials")
         if credentials:
             self._context_send("Browser.setHTTPCredentials",
                            {"browserContextId": context_id,
-                            "credentials": credentials}, timeout=10)
+                            "credentials": credentials})
         if params.get("ignoreHTTPSErrors"):
             self._context_send("Browser.setIgnoreHTTPSErrors",
                            {"browserContextId": context_id,
-                            "ignoreHTTPSErrors": True}, timeout=10)
+                            "ignoreHTTPSErrors": True})
         if params.get("bypassCSP"):
             self._context_send("Browser.setBypassCSP",
                            {"browserContextId": context_id,
-                            "bypassCSP": True}, timeout=10)
+                            "bypassCSP": True})
         # ⛔ Inverted on purpose: Playwright says `javaScriptEnabled=False`,
         # Juggler says `javaScriptDisabled=True`. Passing one straight into the
         # other would turn scripting OFF for every default context, which is
@@ -3965,11 +4598,11 @@ class BrowserDispatcher(Dispatcher):
         if params.get("javaScriptEnabled") is False:
             self._context_send("Browser.setJavaScriptDisabled",
                            {"browserContextId": context_id,
-                            "javaScriptDisabled": True}, timeout=10)
+                            "javaScriptDisabled": True})
         if params.get("hasTouch"):
             self._context_send("Browser.setTouchOverride",
                            {"browserContextId": context_id,
-                            "hasTouch": True}, timeout=10)
+                            "hasTouch": True})
         permissions = params.get("permissions")
         if permissions:
             # ⛔ `"*"` is the wildcard Juggler tests for by name
@@ -3979,7 +4612,7 @@ class BrowserDispatcher(Dispatcher):
             # accident that works until somebody tightens that condition.
             self._context_send("Browser.grantPermissions",
                            {"browserContextId": context_id, "origin": "*",
-                            "permissions": permissions}, timeout=10)
+                            "permissions": permissions})
         viewport = params.get("viewport")
         if viewport:
             # ⛔ `screen` is a SEPARATE option from `viewport` and rides in
@@ -3998,15 +4631,19 @@ class BrowserDispatcher(Dispatcher):
                 wanted["isMobile"] = True
             self._context_send("Browser.setDefaultViewport",
                            {"browserContextId": context_id,
-                            "viewport": wanted}, timeout=10)
+                            "viewport": wanted})
 
-    def _context_send(self, command: str, params: Dict, timeout: float = 10) -> Any:
+    def _context_send(self, command: str, params: Dict) -> Any:
         """A `Browser.*` command about one context. The literal dicts above
         carry `browserContextId` with the id, or with None for the default
-        context; `_address` turns None into the absence Juggler reads."""
+        context; `_address` turns None into the absence Juggler reads.
+
+        Without a bound of its own, as `op_new_context` says: until 0.34.0 each
+        option had 10 s, shorter than anything the caller of newContext
+        waits."""
         return self.conn.send(command,
                               _address(params.get("browserContextId"), params),
-                              timeout=timeout)
+                              timeout=None)
 
     def op_default_context(self, params: Dict) -> Any:
         """The context whose state IS the profile's: userContextId 0, the one
@@ -4165,11 +4802,19 @@ class BrowserTypeDispatcher(Dispatcher):
         # LENGTHENED it, on a slow machine or a cold disk, was cut off at 60
         # regardless. Milliseconds on the wire, seconds here; `0` means "no
         # limit" in Playwright, which is the one value that must not become a
-        # zero-second deadline.
-        wanted = params.get("timeout")
-        ready = 60.0
-        if isinstance(wanted, (int, float)) and wanted > 0:
-            ready = float(wanted) / 1000.0
+        # zero-second deadline: it is no deadline (until 0.34.0 it became the
+        # built-in 60 s).
+        #
+        # ⛔ AND IT BOUNDS THE WHOLE STARTUP, readiness, proxy and
+        # `Browser.enable` alike: the core's `launch` keeps the deadline and
+        # `Connection.startup_send` spends what is left of it. Until 0.34.0
+        # only the readiness wait had it, and the two commands after it had
+        # 10 s and 30 s of their own: on the firefox-41 gate, Linux under
+        # load, the proxy command went unanswered for 10 s and the launch
+        # failed with "the engine refused the proxy" while the caller's 60 s
+        # still had time. A startup past the deadline is a `ReplyTimeout`,
+        # which is a TimeoutError and reaches the client as Playwright's.
+        ready = _caller_timeout(params, default_ms=60000)
         # ⛔ PARSED BEFORE THE BROWSER STARTS, so a proxy we cannot express
         # refuses the launch instead of leaving a process running without one.
         proxy = None
@@ -4179,32 +4824,31 @@ class BrowserTypeDispatcher(Dispatcher):
             except ValueError as exc:
                 raise ProtocolException("launch(proxy=...) cannot be applied: "
                                         "%s" % exc)
+        # ⛔ THE PROXY IS SET BY THE CORE'S `launch`, before any page exists,
+        # and a proxy the engine refuses closes the browser there: the driver
+        # once accepted `proxy=` and dropped it, and a page went out on the
+        # host address while the session's timezone, locale and WebRTC
+        # candidate had been resolved THROUGH the proxy (2026-08-30). Until
+        # 0.34.0 this method sent the command itself, as Selenium's and
+        # Puppeteer's launch did, each with the same fixed 10 s.
         conn = juggler.launch(executable, profile,
                               headless=bool(params.get("headless", True)),
                               env=env, argv_extra=params.get("args") or [],
-                              ready_timeout=ready)
+                              ready_timeout=ready, proxy=proxy)
         self.server.on_shutdown(conn.close)
-        # ⛔ AND SENT BEFORE ANY PAGE EXISTS. The driver used to do this and
-        # nothing here replaced it, so `proxy=` was accepted and dropped for
-        # every scheme the engine prefs do not carry - measured 2026-08-30, a
-        # page resolved its own DNS and went out on the host address while the
-        # session's timezone, locale and WebRTC candidate had all been resolved
-        # THROUGH the proxy. Announcing one country and connecting from another
-        # is worse than having no proxy at all.
-        if proxy is not None:
-            try:
-                conn.send("Browser.setBrowserProxy", proxy, timeout=10)
-            except BaseException as exc:
-                conn.close()
-                raise ProtocolException(
-                    "the engine refused the proxy, so the browser was closed "
-                    "rather than left running without one: %s" % exc)
-        version = read_version(executable)
-        browser = BrowserDispatcher(
-            self.server, self, conn, version, session_seed=session_seed,
-            motion_budget_s=motion_budget_s,
-            service_workers_enabled=prefs.get(
-                "dom.serviceWorkers.enabled") is not False)
+        # ⛔ A LAUNCH THAT FAILS FROM HERE ON CLOSES THE BROWSER IT STARTED.
+        # A browser that is running and was never handed to the caller is one
+        # nobody will close before the server shuts down.
+        try:
+            version = read_version(executable)
+            browser = BrowserDispatcher(
+                self.server, self, conn, version, session_seed=session_seed,
+                motion_budget_s=motion_budget_s,
+                service_workers_enabled=prefs.get(
+                    "dom.serviceWorkers.enabled") is not False)
+        except BaseException:
+            conn.close()
+            raise
         return {"browser": browser.channel}
 
 

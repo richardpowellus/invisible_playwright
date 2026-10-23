@@ -36,9 +36,14 @@ from __future__ import annotations
 import http.server
 import socket
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+
+from invisible_core.juggler.connection import EventListeners
+from invisible_core.juggler.favicon import FaviconRequests
+from invisible_core.juggler.lifecycle import Lifecycle, NavigationMark
 
 
 # -- the unit half: the server, fed the events a navigation produces ---------
@@ -65,8 +70,12 @@ def _bare_page():
     page._requests = {}
     page._request_log = []
     page._navigation_requests = {}
+    # The network branches ask the session's lifecycle which requests are the
+    # favicon; an empty memory answers "none", as for a page without one.
+    page.lifecycle = SimpleNamespace(favicons=FaviconRequests())
     page.messages = up
-    page.context = SimpleNamespace(emit=lambda *a, **k: None, intercepting=False)
+    page.context = SimpleNamespace(emit=lambda *a, **k: None, intercepting=False,
+                                   options={})
     page.frame = SimpleNamespace(frame_id="F1")
     page.frame_for = lambda fid: SimpleNamespace(channel={"guid": "frame@%s" % fid})
     return page
@@ -276,7 +285,7 @@ def test_reload_and_goBack_answer_with_the_channel_of_the_new_navigation():
     page = _bare_page()
     _navigate(page, "NAV-NEW")
     page.lifecycle = SimpleNamespace(
-        frame=lambda fid: SimpleNamespace(navigation="NAV-OLD"),
+        mark=lambda fid: NavigationMark("NAV-OLD", 0),
         wait_for_new_navigation=lambda *a, **kw: "NAV-NEW")
     page.send = lambda method, params=None: {"success": True}
 
@@ -291,7 +300,7 @@ def test_goBack_at_the_start_of_history_is_still_None():
     and it must not start waiting for a navigation that will never happen."""
     page = _bare_page()
     page.lifecycle = SimpleNamespace(
-        frame=lambda fid: SimpleNamespace(navigation="NAV-OLD"),
+        mark=lambda fid: NavigationMark("NAV-OLD", 0),
         wait_for_new_navigation=lambda *a, **kw: pytest.fail(
             "it waited for a navigation the browser refused to start"))
     page.send = lambda method, params=None: {"success": False}
@@ -312,6 +321,7 @@ def test_wait_for_new_navigation_HANDS_BACK_the_id_it_waited_for():
     conn.dispatch_event("Page.frameAttached", {"frameId": "F1"}, "S1")
     conn.dispatch_event("Page.navigationStarted",
                         {"frameId": "F1", "navigationId": "OLD"}, "S1")
+    since = lifecycle.mark("F1")
 
     def navigate_later():
         conn.dispatch_event("Page.navigationStarted",
@@ -323,8 +333,215 @@ def test_wait_for_new_navigation_HANDS_BACK_the_id_it_waited_for():
                             {"frameId": "F1", "name": "load"}, "S1")
 
     threading.Timer(0.05, navigate_later).start()
-    assert lifecycle.wait_for_new_navigation("F1", "OLD", "load",
+    assert lifecycle.wait_for_new_navigation("F1", since, "load",
                                              timeout=10) == "NEW"
+
+
+def _respond(page, **extra):
+    """One request and its response, the response carrying ``extra``."""
+    page._on_juggler_event("Network.requestWillBeSent", {
+        "requestId": "R1", "url": "https://127.0.0.1/", "method": "GET",
+        "frameId": "F1", "isIntercepted": False, "headers": []})
+    page._on_juggler_event("Network.responseReceived", dict(
+        {"requestId": "R1", "status": 200, "statusText": "OK", "headers": []},
+        **extra))
+    return page._requests["R1"].response
+
+
+def test_a_response_hands_on_the_certificate_the_engine_sent():
+    """The same shape as the goto answer above: a value nobody read. Until
+    this, `response.security_details()` answered None for every response,
+    HTTPS included, which a script reads as "not over TLS" (B303 E15). Known
+    bad: the previous `return {"value": None}` turns this red."""
+    details = {"protocol": "TLS 1.3", "subjectName": "probe.local",
+               "issuer": "probe-ca", "validFrom": 1760000000,
+               "validTo": 1762592000}
+    response = _respond(_bare_page(), securityDetails=details)
+    assert response.op_security_details({}) == {"value": details}
+
+
+@pytest.mark.parametrize("sent", [{}, {"securityDetails": None}])
+def test_a_response_with_no_certificate_answers_None(sent):
+    """Plain HTTP, and every engine through firefox-48, which sends null."""
+    response = _respond(_bare_page(), **sent)
+    assert response.op_security_details({}) == {"value": None}
+
+
+class _Pipe(EventListeners):
+    """The subscriber registry the session's lifecycle listens on, and the
+    `post` a held request is released with."""
+
+    def __init__(self, sent):
+        super().__init__()
+        self._sent = sent
+
+    def post(self, method, params=None, session=None):
+        self._sent.append((method, params, session))
+
+
+def _favicon_page(intercepting):
+    """A bare page with a REAL lifecycle on its session, recording what reaches
+    the client and what is posted to the engine."""
+    page = _bare_page()
+    told, sent = [], []
+    pipe = _Pipe(sent)
+    page.lifecycle = Lifecycle(pipe, "S1")
+    page.context = SimpleNamespace(
+        emit=lambda event, params: told.append(event), intercepting=intercepting,
+        browser=SimpleNamespace(conn=pipe))
+    page.session = "S1"
+    page.intercepting = False
+
+    def send(*a, **k):
+        # These events are handled on the reader thread, where a `send`
+        # waits for a reply only that thread could read.
+        pytest.fail("a held request was released with send, from the reader thread")
+
+    page.send = send
+    return page, told, sent
+
+
+def _chain(*, intercepted):
+    """The browser's favicon request, redirected once, in the engine's order:
+    a hop is finished BEFORE the next one is sent."""
+    out = []
+    for rid, url, came_from in (("FAV", "http://127.0.0.1/favicon.ico", None),
+                                ("FAV-redirect1", "http://127.0.0.1/icon.png", "FAV")):
+        params = {"requestId": rid, "url": url, "method": "GET", "frameId": "F1",
+                  "isIntercepted": intercepted, "headers": []}
+        if came_from:
+            params["redirectedFrom"] = came_from
+        out += [("Network.requestWillBeSent", params),
+                ("Network.responseReceived", {
+                    "requestId": rid, "status": 302 if came_from is None else 200,
+                    "statusText": "", "headers": []}),
+                ("Network.requestFinished", {"requestId": rid})]
+    return out
+
+
+def _deliver(page, events, *, held=False):
+    """As the connection delivers: the session's lifecycle first, the page
+    after it. `held`: the page replays them only once the lifecycle has seen
+    the whole chain, as for the events a page holds at its birth."""
+    if held:
+        for method, params in events:
+            page.lifecycle.c.dispatch_event(method, params, "S1")
+        for method, params in events:
+            page._on_juggler_event(method, params)
+        return
+    for method, params in events:
+        page.lifecycle.c.dispatch_event(method, params, "S1")
+        page._on_juggler_event(method, params)
+
+
+def _favicon_chain(page, *, intercepted, held=False):
+    _deliver(page, _chain(intercepted=intercepted), held=held)
+
+
+def test_the_favicon_reaches_the_client_with_no_event():
+    """B321: Playwright shows a client none of the favicon's events. Known bad:
+    without the favicon branch the client was told request, response and
+    requestFinished for both hops."""
+    page, told, _ = _favicon_page(intercepting=False)
+    _favicon_chain(page, intercepted=False)
+    assert told == []
+    assert page._requests == {} and page._request_log == []
+
+
+def test_a_held_favicon_goes_to_the_network_and_to_no_route():
+    """Upstream aborts it; a real Firefox asks the site for it, so it is let
+    through, unseen, instead (`invisible_core.juggler.favicon`)."""
+    page, told, sent = _favicon_page(intercepting=True)
+    _favicon_chain(page, intercepted=True)
+    assert "route" not in told and told == []
+    assert sent == [("Network.resumeInterceptedRequest", {"requestId": "FAV"}, "S1"),
+                    ("Network.resumeInterceptedRequest", {"requestId": "FAV-redirect1"}, "S1")]
+
+
+def test_a_request_held_after_interception_went_off_is_released_without_blocking():
+    """The other caller of the release: the engine held a request, and by its
+    event neither the page nor the context intercepts any more. It used to
+    `send` the release from the reader thread, the deadlock the favicon found."""
+    page, told, sent = _favicon_page(intercepting=False)
+    _deliver(page, [("Network.requestWillBeSent", {
+        "requestId": "R", "url": "http://127.0.0.1/data.json", "method": "GET",
+        "frameId": "F1", "isIntercepted": True, "headers": []})])
+    assert sent == [("Network.resumeInterceptedRequest", {"requestId": "R"}, "S1")]
+    assert told == ["request"]
+
+
+def test_a_page_replaying_held_events_agrees_with_the_lifecycle():
+    """The page replays the events it held at birth after the lifecycle has
+    seen the whole chain, finishes included. One memory, so the same answer."""
+    page, told, _ = _favicon_page(intercepting=False)
+    _favicon_chain(page, intercepted=False, held=True)
+    assert told == []
+    assert page.lifecycle.inflight == 0
+
+
+def test_the_page_answers_with_the_lifecycles_memory_and_keeps_none():
+    """Known bad: a page that classified requests on its own could disagree with
+    the lifecycle about one. Here the lifecycle and the page are handed the same
+    request id with different URLs, and the page must answer as the lifecycle
+    did, whatever its own copy of the event says."""
+    page, told, _ = _favicon_page(intercepting=False)
+    page.lifecycle.c.dispatch_event("Network.requestWillBeSent", {
+        "requestId": "X", "url": "http://127.0.0.1/favicon.ico"}, "S1")
+    page._on_juggler_event("Network.requestWillBeSent", {
+        "requestId": "X", "url": "http://127.0.0.1/data.json", "method": "GET",
+        "frameId": "F1", "isIntercepted": False, "headers": []})
+    assert told == []
+    # And a favicon URL the lifecycle has not seen is not hidden by the page.
+    page._on_juggler_event("Network.requestWillBeSent", {
+        "requestId": "Y", "url": "http://127.0.0.1/favicon.ico", "method": "GET",
+        "frameId": "F1", "isIntercepted": False, "headers": []})
+    assert told == ["request"]
+
+
+def test_a_page_request_beside_the_favicon_is_still_reported():
+    page, told, _ = _favicon_page(intercepting=False)
+    _favicon_chain(page, intercepted=False)
+    _deliver(page, [("Network.requestWillBeSent", {
+        "requestId": "R", "url": "http://127.0.0.1/data.json", "method": "GET",
+        "frameId": "F1", "isIntercepted": False, "headers": []})])
+    assert told == ["request"]
+
+
+def test_a_route_that_sends_a_navigation_on_tells_where_it_went():
+    """B326: `route.fallback(url=...)` on a navigation. The engine applies the
+    URL as an internal redirect and says nothing, so the route tells the
+    request: its response is that URL's, and the lifecycle judges the commit
+    there. Known bad: the response kept the URL the request was sent with, and
+    `goto` refused the page as landed elsewhere."""
+    from invisible_playwright._juggler.server import RouteDispatcher
+
+    page, _told, _sent = _favicon_page(intercepting=True)
+    page.send = lambda command, params=None, timeout=None: {}
+    routed = "http://127.0.0.1/global-var.html"
+    _deliver(page, [("Network.requestWillBeSent", {
+        "requestId": "D", "url": "http://127.0.0.1/foo", "method": "GET",
+        "frameId": "F1", "navigationId": "NAV1", "isIntercepted": True,
+        "headers": []})])
+    request = page._requests["D"]
+    told_lifecycle = []
+    went_to = page.lifecycle.went_to
+    page.lifecycle.went_to = lambda nav, url: (told_lifecycle.append((nav, url)),
+                                               went_to(nav, url))
+    route = object.__new__(RouteDispatcher)
+    route.answered = False
+    route.request = request
+    route.dispose = lambda: None
+    route.op_continue({"url": routed})
+    assert request.url == routed
+    # What the lifecycle does with it is the core's own test
+    # (`test_a_goto_lands_where_it_went.py`); here, that it is told.
+    assert told_lifecycle == [("NAV1", routed)]
+    _deliver(page, [("Network.responseReceived", {
+        "requestId": "D", "status": 200, "statusText": "OK", "headers": []})])
+    assert request.response.initializer["url"] == routed
+    # The request keeps the URL it was sent with: the client applies the
+    # route's override to it on its side, as Playwright's does.
+    assert request.initializer["url"] == "http://127.0.0.1/foo"
 
 
 # -- the e2e half: a real browser, and `.status` read off the answer ---------
@@ -376,6 +593,7 @@ def _serve():
     return srv, "http://127.0.0.1:%d/" % port
 
 
+@pytest.mark.wall_clock
 @pytest.mark.e2e
 def test_navigation_answers_with_a_real_response(firefox_binary):
     """One browser, every navigating method, and each answer is READ.
@@ -421,24 +639,25 @@ def test_navigation_answers_with_a_real_response(firefox_binary):
             assert missing.status == 404, missing.status
             assert missing.ok is False
 
-            # ⛔ NO `go_back` ARM HERE, AND THE REASON IS NOT THIS CHANGE.
-            # [B185] is open: the shipped engine answers `Page.goBack` with
-            # `{success: true}` and then does nothing - no navigation event, no
-            # state change - and the Node driver fails identically on the same
-            # binary, so it is the engine and not the server. Asserting it here
-            # would buy a 30-second timeout on every run and an accusation
-            # pointed at the wrong layer.
-            # `test_juggler_transport.py` already pins that defect with a
-            # STRICT xfail, so the day it is fixed somebody comes back here.
-            # The server half of goBack - that it answers with the channel of
-            # the navigation the wait found - is asserted as a unit above,
-            # which is where it can be asserted without the engine.
-
             # The None THAT IS CORRECT. A same-document navigation creates no
             # document, so Playwright answers null - fixing [B200] must not
             # turn this into an invented object.
             page.goto(url, wait_until="load", timeout=30_000)
             assert page.goto(url + "#deeper", timeout=30_000) is None, (
                 "a same-document navigation must answer None")
+
+            # ⛔ AND HISTORY TO A SAME-DOCUMENT ENTRY ANSWERS None AT ONCE
+            # ([B290]). This arm was left out on the word of [B185], which said
+            # the engine answered `Page.goBack` and then did nothing; [B185]
+            # was closed on 2026-09-17 (the engine does go back) and the
+            # comment stayed, so nobody asked what `go_back` did to a hash
+            # entry: it waited for a navigation id that a same-document
+            # navigation never has, and raised at the timeout. Measured on
+            # 0.35.2: 8.0 s and a TimeoutError for `go_back(timeout=8000)`.
+            for go, where in ((page.go_back, url), (page.go_forward, url + "#deeper")):
+                began = time.monotonic()
+                assert go(timeout=8_000) is None
+                assert time.monotonic() - began < 2.0, "it waited out the timeout"
+                assert page.url == where, page.url
     finally:
         srv.shutdown()

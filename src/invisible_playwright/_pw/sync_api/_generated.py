@@ -9336,6 +9336,40 @@ class Page(SyncContextManager):
             )
         )
 
+    def evaluate_read(
+        self, expression: str, arg: typing.Optional[typing.Any] = None
+    ) -> typing.Any:
+        """Page.evaluate_read
+
+        Not in Playwright: an invisible-playwright addition. `page.evaluate()`
+        for a READ that has no effect on the page, which the caller declares:
+        when the page navigates under it, it is made again on the page that
+        replaced it and answers from there, where `page.evaluate()` raises
+        "Execution context was destroyed, most likely because of a navigation"
+        and never sends the code again. Never pass code with an effect: it may
+        run in both documents.
+
+        Parameters
+        ----------
+        expression : str
+            JavaScript expression to be evaluated in the browser context, as for
+            `page.evaluate()`.
+        arg : Union[Any, None]
+            Optional argument to pass to `expression`.
+
+        Returns
+        -------
+        Any
+        """
+
+        return mapping.from_maybe_impl(
+            self._sync(
+                self._impl_obj.evaluate_read(
+                    expression=expression, arg=mapping.to_impl(arg)
+                )
+            )
+        )
+
     def evaluate_handle(
         self, expression: str, arg: typing.Optional[typing.Any] = None
     ) -> "JSHandle":
@@ -17144,8 +17178,8 @@ class Playwright(SyncBase):
         # from the vendored driver, so `_impl_obj.chromium` no longer exists.
         # Rejects with a line that explains it, instead of an AttributeError.
         raise NotImplementedError(
-            "invisible_playwright pilota SOLO Firefox: il supporto a chromium "
-            "e' stato RIMOSSO dal driver, non e' disabilitato. Usa "
+            "invisible_playwright drives Firefox ONLY: support for chromium "
+            "has been REMOVED from the driver, not disabled. Use "
             "playwright.firefox."
         )
 
@@ -17175,8 +17209,8 @@ class Playwright(SyncBase):
         # from the vendored driver, so `_impl_obj.webkit` no longer exists.
         # Refuse with a line that explains it, instead of an AttributeError.
         raise NotImplementedError(
-            "invisible_playwright pilota SOLO Firefox: il supporto a webkit "
-            "e' stato RIMOSSO dal driver, non e' disabilitato. Usa "
+            "invisible_playwright drives Firefox ONLY: support for webkit "
+            "has been REMOVED from the driver, not disabled. Use "
             "playwright.firefox."
         )
 
