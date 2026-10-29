@@ -128,6 +128,7 @@ def deterministic_rng():
 @pytest.fixture
 def sample_profile():
     """A Profile generated from seed=42 for reuse across tests."""
+    _require_package()
     return generate_profile(seed=42)
 
 
@@ -152,6 +153,10 @@ def firefox_binary():
             return env_path
         pytest.skip(f"INVPW_BINARY_PATH={env_path!r} does not exist")
 
+    # Before the table is read: with the package not importable it is None, and
+    # `in None` answered a TypeError that hid the reason - measured 2026-10-25
+    # with a core whose version the wrapper's pin did not name.
+    _require_package()
     if sys.platform not in BINARY_ENTRY_REL:
         pytest.skip(f"unsupported platform: {sys.platform}")
     from invisible_playwright.download import cache_dir_for_version

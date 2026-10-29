@@ -99,6 +99,49 @@ preference change, and routing remains enabled.
   accepted and saw no request at all while every POST went out. The error
   names the pref and the alternative, `service_workers="block"`.
 
+## [0.43.0] - 2026-10-24
+
+The pin moves to invisible-core 53.48.0, which brings the firefox-53 engine.
+
+### Fixed
+- After a page that runs in a content process of its own (served with
+  Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy, as challenge
+  pages are) sends itself to a page that does not, locators, `inner_text` and
+  `query_selector` no longer fail for good with "Cannot find object with id"
+  when a read was made on the first page. The engine's context ids are now
+  unique for the session, and an element handle kept across such a move can no
+  longer reach a different node.
+
+### Changed
+- The exposed fonts are the set of a clean Windows: Leelawadee, Microsoft
+  Uighur, Wingdings 2 and Wingdings 3, which such a machine does not have, are
+  no longer exposed (67 families).
+
+### Tests
+- e2e: reads on an isolated page, then on the page it sends itself to.
+- The font gate checks that the engine's own manifest declares exactly the
+  canonical families, none more and none less.
+
+## [0.42.0] - 2026-10-24
+
+The pin moves to invisible-core 52.48.0, which brings the firefox-52 engine.
+
+### Changed
+- invisible-core 51.48.0 -> 52.48.0, sealed to the firefox-52 engine (Firefox
+  151.0). A 2D canvas, on the page or offscreen, now reads back exactly as it
+  was drawn, as on retail Firefox: the canvas noise is applied to WebGL and
+  WebGPU readback only, which is unchanged.
+- A `toDataURL`/`toBlob` PNG carries the per-session `deBG` chunk retail
+  Firefox 151 writes after IDAT; the pixels are untouched.
+- 1920x1080 panels are drawn at 125% and 150% as often as the Windows fleet
+  is, so more seeds report a display scale above 1 (core).
+- ClearType gamma and contrast are a declared persona field. Every seed keeps
+  the untuned machine's values today.
+
+### Tests
+- e2e: a 2D canvas reads back as drawn on a page canvas and on an
+  OffscreenCanvas, and screenshots follow the persona's display scale.
+
 ## [0.41.0] - 2026-10-21
 
 The pin moves to invisible-core 51.48.0, which brings the firefox-51 engine.

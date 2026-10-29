@@ -80,6 +80,11 @@ def _serve():
 # thirty lines below, which decode exactly as much as the assertions need: the
 # header, and the first few rows.
 
+def _px(dpr, *css) -> tuple:
+    """CSS pixels as image pixels at the page's devicePixelRatio."""
+    return tuple(int(round(v * dpr)) for v in css)
+
+
 def _size(path) -> tuple:
     with open(path, "rb") as fh:
         head = fh.read(24)
@@ -172,6 +177,9 @@ def shots(tmp_path_factory, firefox_binary):
                 viewport={"width": 800, "height": 600}).new_page()
             page.goto(url, wait_until="load", timeout=30_000)
             tall = page.evaluate("() => document.documentElement.scrollHeight")
+            # A screenshot is in DEVICE pixels, as on a real Windows machine:
+            # at the persona's 125% an 800x600 viewport is a 1000x750 image.
+            dpr = page.evaluate("() => window.devicePixelRatio")
 
             page.screenshot(path=str(out / "top.png"))
             page.screenshot(path=str(out / "whole.png"), full_page=True)
@@ -190,7 +198,7 @@ def shots(tmp_path_factory, firefox_binary):
             page.screenshot(path=str(out / "sideways.png"))
             wide = page.evaluate(
                 "() => document.documentElement.scrollWidth")
-            yield out, tall, wide, landed
+            yield out, tall, wide, landed, dpr
     finally:
         srv.shutdown()
 
@@ -198,16 +206,16 @@ def shots(tmp_path_factory, firefox_binary):
 @pytest.mark.e2e
 def test_the_page_is_the_shape_the_test_believes(shots):
     """Otherwise every assertion below is about a document of another shape."""
-    _, tall, wide, _ = shots
+    _, tall, wide, _, _ = shots
     assert (wide, tall) == (1600, 4000), (
         "the fixture page is %dx%d, not 1600x4000" % (wide, tall))
 
 
 @pytest.mark.e2e
 def test_an_unscrolled_screenshot_is_the_top_of_the_page(shots):
-    out = shots[0]
-    assert _size(out / "top.png") == (800, 600)
-    assert _first_rows(out / "top.png", 1)[0][400] == (255, 255, 255)
+    out, dpr = shots[0], shots[4]
+    assert _size(out / "top.png") == _px(dpr, 800, 600)
+    assert _first_rows(out / "top.png", 1)[0][_px(dpr, 400)[0]] == (255, 255, 255)
 
 
 @pytest.mark.e2e
@@ -218,24 +226,24 @@ def test_after_scrolling_it_photographs_where_you_scrolled_to(shots):
     is red. Before the fix this image was white: a correctly sized picture of
     the wrong place.
     """
-    out = shots[0]
-    assert _size(out / "scrolled.png") == (800, 600)
+    out, dpr = shots[0], shots[4]
+    assert _size(out / "scrolled.png") == _px(dpr, 800, 600)
     row = _first_rows(out / "scrolled.png", 1)[0]
-    assert row[400] == RED, (
+    assert row[_px(dpr, 400)[0]] == RED, (
         "the top of the image is %s, not the red band the viewport is sitting "
-        "on - the screenshot ignored the scroll" % (row[400],))
+        "on - the screenshot ignored the scroll" % (row[_px(dpr, 400)[0]],))
 
 
 @pytest.mark.e2e
 def test_full_page_means_the_whole_page(shots):
     """It was never read by the driver, so it returned the viewport."""
-    out = shots[0]
+    out, dpr = shots[0], shots[4]
     # 1600 and not 800: the document is wider than the viewport, and taking
     # the viewport width here would be the same defect on the other axis.
-    assert _size(out / "whole.png") == (1600, 4000), (
-        "full_page returned %s; the document is 1600x4000" % (
-            _size(out / "whole.png"),))
-    assert _first_rows(out / "whole.png", 1)[0][400] == (255, 255, 255)
+    assert _size(out / "whole.png") == _px(dpr, 1600, 4000), (
+        "full_page returned %s; the document is 1600x4000 at dpr %s" % (
+            _size(out / "whole.png"), dpr))
+    assert _first_rows(out / "whole.png", 1)[0][_px(dpr, 400)[0]] == (255, 255, 255)
 
 
 @pytest.mark.e2e
@@ -244,9 +252,9 @@ def test_a_clip_the_caller_gave_is_left_alone(shots):
     wants, so there is nothing to translate - and the fix must not start
     translating it. Known-bad: adding the scroll offset to a caller's clip,
     which would move this crop 1000px down onto the black."""
-    out = shots[0]
-    assert _size(out / "clipped.png") == (400, 200)
-    assert _first_rows(out / "clipped.png", 1)[0][200] == RED
+    out, dpr = shots[0], shots[4]
+    assert _size(out / "clipped.png") == _px(dpr, 400, 200)
+    assert _first_rows(out / "clipped.png", 1)[0][_px(dpr, 200)[0]] == RED
 
 
 @pytest.mark.e2e
@@ -257,15 +265,15 @@ def test_it_follows_a_sideways_scroll_too(shots):
     test in this file green, because none of them scrolled sideways. A green
     suite that cannot see half of a two-line fix is measuring one line.
     """
-    out, _, _, landed = shots
+    out, _, _, landed, dpr = shots
     assert landed > 0, "the page did not scroll sideways at all"
-    assert _size(out / "sideways.png") == (800, 600)
+    assert _size(out / "sideways.png") == _px(dpr, 800, 600)
     # The green column lives at document x 1400..1600, so in an image taken
     # at scrollX `landed` it starts at 1400 - landed. Computed, not guessed.
     x = 1400 - landed + 100
     assert 0 <= x < 800, "the column is not in this viewport (scrollX=%d)" % landed
     row = _first_rows(out / "sideways.png", 1)[0]
-    assert row[x] == GREEN, (
+    assert row[_px(dpr, x)[0]] == GREEN, (
         "at image x=%d the colour is %s, not the green column that sits there "
         "when the viewport is at scrollX=%d - the screenshot ignored the "
-        "horizontal scroll" % (x, row[x], landed))
+        "horizontal scroll" % (x, row[_px(dpr, x)[0]], landed))

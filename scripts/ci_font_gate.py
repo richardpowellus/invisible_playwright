@@ -68,12 +68,12 @@ EXPECTED = [
     "Arial", "Bahnschrift", "Calibri", "Cambria", "Cambria Math", "Candara",
     "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New",
     "Ebrima", "Franklin Gothic", "Gabriola", "Gadugi", "Georgia", "Impact",
-    "Ink Free", "Javanese Text", "Leelawadee", "Leelawadee UI",
+    "Ink Free", "Javanese Text", "Leelawadee UI",
     "Lucida Console", "Lucida Sans Unicode", "MS Gothic", "MS PGothic",
     "MS UI Gothic", "MV Boli", "Malgun Gothic", "Marlett",
     "Microsoft Himalaya", "Microsoft JhengHei", "Microsoft JhengHei UI",
     "Microsoft New Tai Lue", "Microsoft PhagsPa", "Microsoft Sans Serif",
-    "Microsoft Tai Le", "Microsoft Uighur", "Microsoft YaHei",
+    "Microsoft Tai Le", "Microsoft YaHei",
     "Microsoft YaHei UI", "Microsoft Yi Baiti", "MingLiU-ExtB",
     "Mongolian Baiti", "Myanmar Text", "NSimSun", "Nirmala UI",
     "PMingLiU-ExtB", "Palatino Linotype", "Segoe Fluent Icons",
@@ -81,7 +81,7 @@ EXPECTED = [
     "Segoe UI Emoji", "Segoe UI Historic", "Segoe UI Symbol", "SimSun",
     "SimSun-ExtB", "Sitka Small", "Sylfaen", "Symbol", "Tahoma",
     "Times New Roman", "Trebuchet MS", "Twemoji Mozilla", "Verdana",
-    "Webdings", "Wingdings", "Wingdings 2", "Wingdings 3", "Yu Gothic",
+    "Webdings", "Wingdings", "Yu Gothic",
     "Yu Gothic UI",
 ]
 
@@ -274,6 +274,40 @@ _PREFS: dict = {}
 # because it is the only place from which the discovery of an unexpected host
 # font can arrive. A name that is in neither list is invisible to this gate
 # by construction.
+#
+# ⛔ FOR THE BUNDLE IT IS CLOSED, and not from the page: the engine exposes
+# exactly the families its manifest declares (the list IS the bundle), and
+# that manifest is a file in the artifact under test, beside the binary. So
+# the gate reads it and asks the allow-list question directly: these families
+# and ONLY these, none more and none less. A family put back into the bundle
+# is refused even if no list here names it, which a list of names to look for
+# as absent can never promise (2026-10-25, when four families left the bundle
+# and the first draft of this change listed them one by one).
+
+
+def manifest_families(exe: str):
+    """The families the binary's own manifest declares, or None if there is none.
+
+    `fonts/bundle-fonts.list` beside the binary on Windows and Linux, and in
+    `Contents/Resources/fonts` of the bundle on macOS, where the binary is in
+    `Contents/MacOS`. None is a refusal for the caller: a gate that could not
+    read the list it checks has checked nothing.
+    """
+    binary = Path(exe)
+    for fonts in (binary.parent / "fonts",
+                  binary.parent.parent / "Resources" / "fonts"):
+        manifest = fonts / "bundle-fonts.list"
+        if manifest.is_file():
+            return [line.split("|")[1]
+                    for line in manifest.read_text(encoding="ascii").splitlines()
+                    if line.startswith("F|")]
+    return None
+
+
+def manifest_mismatch(declared):
+    """(declared but not expected, expected but not declared), both sorted."""
+    return (sorted(set(declared) - set(EXPECTED)),
+            sorted(set(EXPECTED) - set(declared)))
 
 
 def main(exe: str) -> int:
@@ -396,8 +430,24 @@ def main(exe: str) -> int:
         for line in face_bad:
             print(f"[font-gate]   {line}")
 
+    declared = manifest_families(exe)
+    manifest_bad = declared is None
+    if manifest_bad:
+        print("[font-gate] MANIFEST: no fonts/bundle-fonts.list beside the "
+              "binary, so the declared families could not be checked")
+    else:
+        undeclared_extra, undeclared_missing = manifest_mismatch(declared)
+        if undeclared_extra or undeclared_missing:
+            manifest_bad = True
+            print(f"[font-gate] MANIFEST: declares {len(declared)} families, "
+                  f"expected exactly {len(EXPECTED)}")
+            if undeclared_extra:
+                print(f"[font-gate]   declared, not in the canonical set: {undeclared_extra}")
+            if undeclared_missing:
+                print(f"[font-gate]   in the canonical set, not declared: {undeclared_missing}")
+
     ok = (not missing and not extra and not leaked_host and not gen_bad
-          and not face_bad)
+          and not face_bad and not manifest_bad)
     if ok:
         print(f"FONT GATE OK - exactly the {n} Windows families, host-leak 0, "
               f"generics map to Windows (serif/sans/mono/system-ui), "

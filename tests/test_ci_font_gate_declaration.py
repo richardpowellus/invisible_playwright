@@ -141,3 +141,68 @@ def test_the_family_list_in_the_gate_matches_the_core_manifest():
             "installs the PUBLISHED core, not the tree's, so a gate updated "
             "before the core is on the index sees the old manifest. Publish "
             "the core, then move the pin, then use the new list.")
+
+
+def _gate_functions() -> dict:
+    """The gate's helpers and lists, read without importing Playwright."""
+    src = _GATE.read_text(encoding="utf-8")
+    ns: dict = {}
+    exec(compile(src.split("def main")[0], str(_GATE), "exec"), ns)  # noqa: S102 - it's our own file
+    return ns
+
+
+def _binary_with_manifest(root: Path, families, *, macos: bool = False) -> str:
+    if macos:
+        binary = root / "Firefox.app" / "Contents" / "MacOS" / "firefox"
+        fonts = root / "Firefox.app" / "Contents" / "Resources" / "fonts"
+    else:
+        binary = root / "firefox" / "firefox.exe"
+        fonts = binary.parent / "fonts"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    fonts.mkdir(parents=True, exist_ok=True)
+    rows = ["# bundle-fonts.list"]
+    for name in families:
+        rows += ["F|" + name, "f|file.ttf|0|400|400|100|100|normal|PS"]
+    (fonts / "bundle-fonts.list").write_text("\n".join(rows) + "\n", encoding="ascii")
+    return str(binary)
+
+
+@pytest.mark.unit
+def test_the_gate_accepts_a_manifest_of_exactly_the_canonical_families(tmp_path):
+    gate = _gate_functions()
+    exe = _binary_with_manifest(tmp_path, gate["EXPECTED"])
+    assert gate["manifest_mismatch"](gate["manifest_families"](exe)) == ([], [])
+
+
+@pytest.mark.unit
+def test_a_family_put_back_into_the_bundle_is_refused_though_no_list_names_it(tmp_path):
+    """The allow-list question: ONLY the canonical families. Leelawadee left
+    the bundle on 2026-10-25 and is named nowhere in the gate; a build that
+    declared it again must still fail."""
+    gate = _gate_functions()
+    assert "Leelawadee" not in gate["EXPECTED"] + gate["HOST_MUST_BE_ABSENT"]
+    exe = _binary_with_manifest(tmp_path, gate["EXPECTED"] + ["Leelawadee"])
+    assert gate["manifest_mismatch"](gate["manifest_families"](exe)) == (["Leelawadee"], [])
+
+
+@pytest.mark.unit
+def test_a_canonical_family_missing_from_the_bundle_is_refused(tmp_path):
+    gate = _gate_functions()
+    exe = _binary_with_manifest(tmp_path, gate["EXPECTED"][1:])
+    assert gate["manifest_mismatch"](gate["manifest_families"](exe)) == (
+        [], [gate["EXPECTED"][0]])
+
+
+@pytest.mark.unit
+def test_the_manifest_is_found_in_a_macos_bundle(tmp_path):
+    gate = _gate_functions()
+    exe = _binary_with_manifest(tmp_path, gate["EXPECTED"], macos=True)
+    assert gate["manifest_families"](exe) == gate["EXPECTED"]
+
+
+@pytest.mark.unit
+def test_no_manifest_is_no_answer_not_a_pass(tmp_path):
+    gate = _gate_functions()
+    binary = tmp_path / "firefox.exe"
+    binary.write_bytes(b"")
+    assert gate["manifest_families"](str(binary)) is None
