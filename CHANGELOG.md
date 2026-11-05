@@ -98,6 +98,12 @@ preference change, and routing remains enabled.
   interception hook while that pref is true, so a route set as a guard was
   accepted and saw no request at all while every POST went out. The error
   names the pref and the alternative, `service_workers="block"`.
+### Removed
+- Linux arm64 is no longer supported from firefox-56: no engine is built for
+  it. firefox-55 is the last engine with a Linux arm64 build. The engines are
+  Linux x86_64 and Windows x86_64; Windows on ARM64 still runs the x86_64
+  engine.
+
 ## [0.45.0] - 2026-11-04
 
 The pin moves to invisible-core 55.50.0, which brings the firefox-55 engine.
