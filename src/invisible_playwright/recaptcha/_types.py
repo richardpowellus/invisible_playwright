@@ -97,6 +97,16 @@ class RecaptchaSolver(Protocol):
         ...
 
 
+class ImageTextSolver(Protocol):
+    """A service that recognises a base64-encoded image."""
+
+    def solve_image_to_text(
+        self, body_b64: str, *, module: str | None = None,
+        case_sensitive: bool = False,
+    ) -> str:
+        ...
+
+
 @dataclass(frozen=True)
 class RecaptchaResult:
     """What `solve_recaptcha` did on the page."""

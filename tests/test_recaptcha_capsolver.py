@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from invisible_playwright.recaptcha import _capsolver
+from invisible_playwright.recaptcha import _capsolver, solve_image_text
 from invisible_playwright.recaptcha._capsolver import CapSolver
 from invisible_playwright.recaptcha._types import (
     RecaptchaChallenge,
@@ -83,6 +83,127 @@ def solver_for(*responses, repeat=None, **kwargs):
 
 def error_response(code, description="provider refused"):
     return {"errorId": 1, "errorCode": code, "errorDescription": description}
+
+
+def test_image_to_text_sync_sends_base64_and_options():
+    solver, transport, clock = solver_for(
+        {"errorId": 0, "status": "ready", "solution": {"text": " AbC12 \n"}},
+        app_id="our-app",
+    )
+    assert solve_image_text(
+        b"\x89PNG\x00", solver=solver, module="number", case_sensitive=True,
+    ) == "AbC12"
+    assert transport.calls == [
+        ("https://api.capsolver.com/createTask", {
+            "clientKey": KEY,
+            "task": {
+                "type": "ImageToTextTask", "body": "iVBORwA=",
+                "module": "number", "case": True,
+            },
+            "appId": "our-app",
+        }, 30),
+    ]
+    assert clock.sleeps == []
+
+
+def test_image_to_text_polls_and_omits_unspecified_module():
+    solver, transport, clock = solver_for(
+        CREATED, {"status": "processing"},
+        {"status": "ready", "solution": {"text": "  1234  "}},
+    )
+    assert solver.solve_image_to_text("aW1hZ2U=") == "1234"
+    assert transport.calls[0][1]["task"] == {
+        "type": "ImageToTextTask", "body": "aW1hZ2U=", "case": False,
+    }
+    assert [call[0].rsplit("/", 1)[-1] for call in transport.calls] == [
+        "createTask", "getTaskResult", "getTaskResult",
+    ]
+    assert clock.sleeps == [3, 3]
+
+
+@pytest.mark.parametrize("text", [None, "", " \n ", 123])
+@pytest.mark.parametrize("poll", [False, True])
+def test_image_to_text_rejects_empty_or_invalid_text(text, poll):
+    ready = {"status": "ready", "solution": {"text": text}}
+    solver, _, _ = solver_for(*([CREATED, ready] if poll else [ready]))
+    with pytest.raises(SolverError, match="no text"):
+        solver.solve_image_to_text("aW1hZ2U=")
+
+
+@pytest.mark.parametrize("poll", [False, True])
+def test_image_to_text_maps_provider_errors_without_exposing_image(poll, caplog):
+    image = "aW1hZ2U="
+    error = error_response("ERROR_INVALID_IMAGE", f"{KEY} {image} image")
+    responses = [{"taskId": f"{KEY}{image}"}, error] if poll else [error]
+    solver, _, _ = solver_for(*responses)
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(SolverRequestError) as caught:
+        solver.solve_image_to_text(image)
+    assert caught.value.code == "ERROR_INVALID_IMAGE"
+    for secret in (KEY, image):
+        assert secret not in str(caught.value)
+        assert secret not in "".join(traceback.format_exception(caught.value))
+        assert secret not in caplog.text
+
+
+def test_image_to_text_hides_transport_errors_and_unknown_provider_codes():
+    image = "aW1hZ2U="
+    for response in (
+        SolverRequestError(f"{KEY} {image}", code=image),
+        error_response(image, f"{KEY} {image}"),
+    ):
+        solver, _, _ = solver_for(response)
+        with pytest.raises(SolverError) as caught:
+            solver.solve_image_to_text(image)
+        assert caught.value.code is None
+        assert KEY not in str(caught.value)
+        assert image not in "".join(traceback.format_exception(caught.value))
+
+
+def test_image_to_text_hides_task_id_in_timeouts_and_logs(caplog):
+    image = "aW1hZ2U="
+    solver, _, _ = solver_for({"taskId": f"{KEY}{image}"}, repeat={"status": "processing"})
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(SolverTimeoutError) as caught:
+        solver.solve_image_to_text(image)
+    for secret in (KEY, image):
+        assert secret not in str(caught.value)
+        assert secret not in caplog.text
+
+
+@pytest.mark.parametrize("body", ["", "data:image/png;base64,aW1hZ2U=", "not base64", None])
+def test_image_to_text_rejects_invalid_base64_before_network(body):
+    solver, transport, _ = solver_for()
+    with pytest.raises(SolverRequestError, match="base64"):
+        solver.solve_image_to_text(body)
+    assert transport.calls == []
+
+
+def test_image_to_text_default_solver_requires_the_same_key(monkeypatch):
+    monkeypatch.delenv("CAPSOLVER_API_KEY", raising=False)
+    with pytest.raises(SolverAuthError, match="CAPSOLVER_API_KEY"):
+        solve_image_text(b"image")
+
+
+def test_image_to_text_default_solver_reads_environment_key(monkeypatch):
+    transport = Transport({"status": "ready", "solution": {"text": "answer"}})
+    monkeypatch.setenv("CAPSOLVER_API_KEY", KEY)
+    monkeypatch.setattr(_capsolver, "_post_json", transport)
+    assert solve_image_text(b"image") == "answer"
+    assert transport.calls[0][1]["clientKey"] == KEY
+
+
+def test_image_to_text_custom_solver_result_is_validated():
+    class Solver:
+        def solve_image_to_text(self, body_b64, *, module, case_sensitive):
+            assert (body_b64, module, case_sensitive) == ("aW1hZ2U=", "common", False)
+            return "  answer  "
+
+    assert solve_image_text(b"image", solver=Solver(), module="common") == "answer"
+    with pytest.raises(SolverError, match="no text"):
+        solve_image_text(b"image", solver=type("EmptySolver", (), {
+            "solve_image_to_text": lambda self, *args, **kwargs: "  ",
+        })())
 
 
 @pytest.mark.parametrize("status", ["processing", "idle"])
