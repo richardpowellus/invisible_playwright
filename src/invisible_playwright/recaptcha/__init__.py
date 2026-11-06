@@ -54,9 +54,9 @@ __all__ = [
     "SolverUnsolvableError",
     "detect_recaptcha",
     "detect_recaptcha_async",
+    "solve_image_text",
     "solve_recaptcha",
     "solve_recaptcha_async",
-    "solve_image_text",
 ]
 
 
