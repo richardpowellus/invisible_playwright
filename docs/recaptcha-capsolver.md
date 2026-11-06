@@ -47,6 +47,32 @@ for the form it was solved for until it expires, so treat it like one.
 `CapSolver(...).balance()` returns the account balance in USD, which is a cheap way
 to check the key works before a run.
 
+## Image-to-text CAPTCHAs
+
+For a distorted-text image, pass the image bytes to the blocking
+`solve_image_text` helper. It uses `CAPSOLVER_API_KEY` unless a solver is supplied.
+The caller supplies the image and is responsible for typing the answer and
+submitting the form.
+
+```python
+from invisible_playwright.recaptcha import CapSolver, solve_image_text
+
+image = page.locator("img.captcha").screenshot()
+text = solve_image_text(image, module="common", case_sensitive=True)
+# Or use an explicitly configured provider:
+text = solve_image_text(image, solver=CapSolver(api_key=key))
+```
+
+The helper base64-encodes the image without a data URL prefix and sends an
+`ImageToTextTask`. `module` is optional (for example, `common` or `number`);
+`case_sensitive` sets the task's `case` flag. The result is stripped
+`solution.text`; missing or empty text raises `SolverError`. The underlying
+`CapSolver.solve_image_to_text(body_b64, *, module=None, case_sensitive=False)`
+accepts an already base64-encoded body. It handles an immediate ready result
+or polls a returned task ID, with a 120-second deadline. Retries and paid-task
+charges follow the same rules as reCAPTCHA below. Image data is sent to CapSolver;
+neither it nor the key is included in logs or solver error messages.
+
 ## What it does on the page
 
 1. **Finds the widget**, in the page and every frame: `data-sitekey` elements and

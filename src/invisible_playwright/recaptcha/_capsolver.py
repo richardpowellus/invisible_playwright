@@ -1,6 +1,8 @@
 """A blocking CapSolver client, independent of pages and browser state."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import math
@@ -153,7 +155,7 @@ class CapSolver:
         return task
 
     def _request(self, endpoint: str, payload: dict[str, Any],
-                 timeout: float) -> dict[str, Any]:
+                 timeout: float, *, private: bool = False) -> dict[str, Any]:
         failure: SolverError | None = None
         try:
             response = self._transport(
@@ -162,9 +164,10 @@ class CapSolver:
             )
         except SolverError as error:
             # Raise outside the handler so even __context__ cannot retain a key.
+            code = error.code if not private or error.code in _ERRORS else None
             failure = type(error)(
-                self._redact(str(error)), provider=self.name,
-                code=self._redact(error.code) if error.code else None,
+                self._redact("CapSolver request failed" if private else str(error)),
+                provider=self.name, code=self._redact(code) if code else None,
             )
         except (urllib.error.URLError, OSError, HTTPException):
             failure = SolverUnavailableError(
@@ -189,10 +192,14 @@ class CapSolver:
         if response.get("errorId", 0) != 0:
             code = response.get("errorCode")
             code = code if isinstance(code, str) else None
+            error_type = _ERRORS.get(code or "", SolverError)
             description = response.get("errorDescription")
             if not isinstance(description, str):
                 description = "CapSolver returned an error"
-            raise _ERRORS.get(code or "", SolverError)(
+            if private:
+                code = code if code in _ERRORS else None
+                description = "CapSolver returned an error"
+            raise error_type(
                 self._redact(f"{code}: {description}" if code else description),
                 provider=self.name, code=self._redact(code) if code else None,
             )
@@ -241,11 +248,43 @@ class CapSolver:
         )
 
     def solve(self, challenge: RecaptchaChallenge, *, timeout: float) -> RecaptchaSolution:
+        response, task_id, started = self._run_task(self.task_for(challenge), timeout)
+        return self._solution(response, task_id, started)
+
+    def solve_image_to_text(
+        self, body_b64: str, *, module: str | None = None,
+        case_sensitive: bool = False,
+    ) -> str:
+        """Recognise a base64-encoded image with CapSolver."""
+        try:
+            if not isinstance(body_b64, str) or not body_b64:
+                raise ValueError
+            base64.b64decode(body_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise SolverRequestError(
+                "Image body must be non-empty base64 without a data URL prefix",
+                provider=self.name,
+            ) from None
+        task: dict[str, Any] = {
+            "type": "ImageToTextTask", "body": body_b64, "case": case_sensitive,
+        }
+        if module is not None:
+            task["module"] = module
+        response, _, _ = self._run_task(task, 120.0, private=True)
+        solution = response.get("solution")
+        text = solution.get("text") if isinstance(solution, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise SolverError("CapSolver ready result has no text", provider=self.name)
+        return text.strip()
+
+    def _run_task(
+        self, task: dict[str, Any], timeout: float, *, private: bool = False,
+    ) -> tuple[dict[str, Any], str | None, float]:
         if not 0 < timeout <= 300:
             raise ValueError("timeout must be greater than 0 and at most 300 seconds")
         started = self._clock()
         deadline = started + timeout
-        payload: dict[str, Any] = {"task": self.task_for(challenge)}
+        payload: dict[str, Any] = {"task": task}
         if self._app_id is not None:
             payload["appId"] = self._app_id
 
@@ -254,7 +293,7 @@ class CapSolver:
         for attempt in range(3):
             remaining = self._remaining(started, deadline, None)
             try:
-                response = self._request("/createTask", payload, remaining)
+                response = self._request("/createTask", payload, remaining, private=private)
             except SolverUnavailableError:
                 self._remaining(started, deadline, None)
                 if attempt == 2:
@@ -270,33 +309,37 @@ class CapSolver:
         # been paid for, and the caller's deadline exists to stop waiting, not
         # to discard a result already in hand.
         if response.get("status") == "ready":
-            return self._solution(response, task_id, started)
-        self._remaining(started, deadline, task_id)
+            return response, task_id, started
+        self._remaining(started, deadline,
+                        "<redacted>" if private and task_id is not None else task_id)
         if task_id is None:
             raise SolverError("CapSolver returned no taskId", provider=self.name)
+        safe_task_id = "<redacted>" if private else task_id
         _LOG.debug("task_id=%s status=created elapsed=%.1fs",
-                   self._redact(task_id), self._clock() - started)
+                   self._redact(safe_task_id), self._clock() - started)
 
         delay = self.poll_interval
         for _ in range(120):
-            self._pause(delay, started, deadline, task_id)
-            remaining = self._remaining(started, deadline, task_id)
+            self._pause(delay, started, deadline, safe_task_id)
+            remaining = self._remaining(started, deadline, safe_task_id)
             try:
-                response = self._request("/getTaskResult", {"taskId": task_id}, remaining)
+                response = self._request(
+                    "/getTaskResult", {"taskId": task_id}, remaining, private=private,
+                )
             except SolverUnavailableError:
-                self._remaining(started, deadline, task_id)
+                self._remaining(started, deadline, safe_task_id)
                 delay = min(10.0, delay * 2)
                 continue
             status = response.get("status")
             if status not in ("idle", "processing", "ready"):
                 raise SolverError("CapSolver returned an invalid task status", provider=self.name)
             _LOG.debug("task_id=%s status=%s elapsed=%.1fs",
-                       self._redact(task_id), status, self._clock() - started)
+                       self._redact(safe_task_id), status, self._clock() - started)
             if status == "ready":
-                return self._solution(response, task_id, started)
+                return response, task_id, started
             delay = self.poll_interval
         raise SolverTimeoutError(
-            f"CapSolver task {self._redact(task_id)} exhausted 120 result queries "
+            f"CapSolver task {self._redact(safe_task_id)} exhausted 120 result queries "
             f"after {self._clock() - started:.1f}s", provider=self.name,
         )
 
