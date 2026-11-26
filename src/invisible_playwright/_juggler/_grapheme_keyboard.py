@@ -1,35 +1,40 @@
 """Fork-only: the keyboard types text one grapheme cluster at a time.
 
-See `_graphemes` for the defect. This is invisible_core 55.50.0's
+See `_graphemes` for the defect. This is the pinned invisible_core's
 `Keyboard.type`, unchanged except that it walks clusters instead of code
 points: a cluster that is one character with a key is pressed exactly as
 before (same plan, same Shift runs, same gaps), and any other cluster goes in
 whole through one `insert_text`.
 
-⛔ IT IS A COPY OF ONE CORE VERSION'S LOOP, SO IT RUNS ON THAT VERSION ONLY.
-Installed over a different core it would replace that core's typing (upstream
-69.x sends every key at its planned instant, `_stroke`) with 55.50.0's. So
-`install` refuses any other version and leaves the core's own keyboard in
-place, and `test_a_cluster_is_entered_whole` fails when the engine's pin moves,
+⛔ IT IS A COPY OF ONE CORE'S LOOP, SO IT RUNS ON THAT LOOP ONLY. Installed
+over a different core it would replace that core's typing (upstream 69.x sends
+every key at its planned instant, `_stroke`) with this one. So `install`
+compares a SHA-256 of the core's own `Keyboard.type` source with the one this
+was copied from, refuses on any difference and leaves the core's keyboard in
+place, and `test_a_cluster_is_entered_whole` fails when the core changes,
 which is the prompt to drop this file once the core types clusters itself
 (the upstream core PR) or to port it.
 """
 from __future__ import annotations
+
+import hashlib
+import inspect
 
 from invisible_core.juggler import keyboard as _kb
 from invisible_core.juggler.keyboard import Keyboard, LAYOUT_CLOSURE
 
 from ._graphemes import graphemes
 
-#: The core whose `Keyboard.type` this file copies.
-CORE_VERSION = "55.50.0"
+#: SHA-256 of the source of the core `Keyboard.type` this file copies. A
+#: digest, not a version: the core version is declared in pyproject.toml only
+#: (`tests/test_core_pin.py`), and the loop is what has to match.
+COPIED_TYPE_SHA256 = "534cf5aa30245033f28fc7f4ed2aa5c506061df84f4be62fd70f288d5268be00"
 
 
-def _core_version() -> str:
+def core_type_sha256() -> str:
     try:
-        import invisible_core
-        return str(getattr(invisible_core, "__version__", ""))
-    except Exception:  # pragma: no cover - the import succeeded above
+        return hashlib.sha256(inspect.getsource(Keyboard.type).encode()).hexdigest()
+    except (OSError, TypeError):  # no source to read: cannot show it matches
         return ""
 
 
@@ -95,7 +100,7 @@ class GraphemeKeyboard(Keyboard):
 def install(keyboard) -> bool:
     """Make `keyboard` type clusters, when it is the core this was copied
     from. Answers whether it did."""
-    if _core_version() != CORE_VERSION or type(keyboard) is not Keyboard:
+    if core_type_sha256() != COPIED_TYPE_SHA256 or type(keyboard) is not Keyboard:
         return False
     keyboard.__class__ = GraphemeKeyboard
     return True
