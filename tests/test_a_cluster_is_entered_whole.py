@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-import invisible_core
 from invisible_core.juggler._behaviour import PageActs
 from invisible_core.juggler.keyboard import Keyboard
 
 from invisible_playwright._juggler._grapheme_keyboard import (
-    CORE_VERSION, GraphemeKeyboard, install)
+    COPIED_TYPE_SHA256, GraphemeKeyboard, core_type_sha256, install)
 from invisible_playwright._juggler._graphemes import graphemes
 
 pytestmark = pytest.mark.unit
@@ -85,8 +84,8 @@ def test_a_base_with_a_combining_mark_is_not_a_key_then_a_mark():
     "Brett's Biltong!\n\nWhile stocks last.", "café 中a\U0001f600", "ABC !! a@b",
 ])
 def test_text_without_clusters_sends_what_the_core_sent(text):
-    if invisible_core.__version__ != CORE_VERSION:
-        pytest.skip("the copied loop is only installed on %s" % CORE_VERSION)
+    if core_type_sha256() != COPIED_TYPE_SHA256:
+        pytest.skip("the copied loop is only installed on the core it was copied from")
     new_c, new = _kb()
     old_c, old = _kb(Keyboard)
     new.type(text)
@@ -95,11 +94,11 @@ def test_text_without_clusters_sends_what_the_core_sent(text):
 
 
 def test_it_is_installed_on_the_core_it_was_copied_from_and_only_there():
-    """⛔ When this fails the engine's core pin moved: drop the fork copy if the
-    core now types clusters itself, or port `GraphemeKeyboard` to the new loop."""
-    assert invisible_core.__version__ == CORE_VERSION, (
-        "invisible_core is %s; _grapheme_keyboard copies %s's Keyboard.type"
-        % (invisible_core.__version__, CORE_VERSION))
+    """⛔ When this fails the core's `Keyboard.type` changed (the pin moved):
+    drop the fork copy if the core now types clusters itself, or port
+    `GraphemeKeyboard` to the new loop and update COPIED_TYPE_SHA256."""
+    assert core_type_sha256() == COPIED_TYPE_SHA256, (
+        "the core's Keyboard.type is not the one _grapheme_keyboard copies")
     c = _Fake()
     kb = Keyboard(c, "S", acts=PageActs(1))
     assert install(kb) is True

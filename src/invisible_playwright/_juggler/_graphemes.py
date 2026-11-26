@@ -1,8 +1,8 @@
 """Typed text in the units a person enters it: one grapheme cluster at a time.
 
 ⛔ A CHARACTER WITH NO KEY WAS INSERTED ONE CODE POINT AT A TIME, and a
-cluster is several. invisible_core's `Keyboard.type` (55.50.0, and upstream
-main as of 69.82.0) walks the text by Python character and sends one
+cluster is several. invisible_core's `Keyboard.type` (the pinned core, and
+upstream main until oss-invisible/core#333) walks the text by Python character and sends one
 `Page.insertText` for each code point the layout has no key for. Each insert
 is a composition of its own, so the page saw:
 
