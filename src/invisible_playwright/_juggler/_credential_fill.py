@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import time
 
-from invisible_core.juggler.actions import Actions, ElementNotActionable
+from invisible_core.juggler.actions import ActionMissed, Actions, ElementNotActionable
 from invisible_core.juggler.connection import ProtocolError, TargetClosedError
 from invisible_core.juggler.injected import EvaluationError, UTILITY_WORLD
 
 from .._origin import redact_fill_value, validate_fill_expectations
+from ._grapheme_keyboard import install as _type_graphemes
 
 
 _CHECK_FILL_EXPECTATIONS = """function checkFillExpectations(
@@ -48,7 +49,103 @@ _CHECK_FILL_EXPECTATIONS = """function checkFillExpectations(
 }"""
 
 
+#: Where the focus is, relative to the field being typed into: "in" when the
+#: field (or, for editable content, a node inside it or the editing host
+#: around it) holds it; "editable" when the page moved it to another text
+#: field, as a one-time code split across boxes does (the keys follow it
+#: there, as a person's would, and the MCP reports how much the first box
+#: kept); "gone" when the field left the document; else a short description
+#: of what has it. Read in the utility world: the page sees no
+#: event and none of its own code runs.
+_FOCUS_JS = (
+    "(injected, el) => {"
+    "  if (!el.isConnected) return 'gone';"
+    "  const r = el.getRootNode ? el.getRootNode() : document;"
+    "  const a = r.activeElement;"
+    "  if (a && (a === el || el.contains(a) || (a.isContentEditable && a.contains(el))))"
+    "    return 'in';"
+    "  const t = a ? (a.type || '').toLowerCase() : '';"
+    "  if (a && (a.isContentEditable || a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' &&"
+    "      ['', 'text', 'search', 'tel', 'url', 'email', 'number', 'password'].includes(t))))"
+    "    return 'editable';"
+    "  if (!a || a === document.body) return 'the page itself';"
+    "  const label = a.getAttribute('aria-label') || a.getAttribute('name') || '';"
+    "  return '<' + a.tagName.toLowerCase() + (a.id ? '#' + a.id : '') +"
+    "    (label ? ' ' + JSON.stringify(label.slice(0, 60)) : '') + '>'; }")
+
+#: How long a field that lost the focus mid-typing has to get it back before
+#: typing stops. Editors that rebuild their DOM (Draft.js resolving a
+#: composition) hand it back within a few frames.
+FOCUS_RETURN_S = 2.0
+_FOCUS_POLL_S = 0.05
+
+
+class FocusLeftField(ActionMissed):
+    """Typing stopped because the field no longer had the focus.
+
+    ⛔ NOT RETRYABLE, for `ActionMissed`'s reason: part of the text is in the
+    field. And NOT IGNORED: a key sent while another element has the focus
+    goes to that element. On 2026-11-26 Meta Business Suite's composer lost the
+    focus partway through a 356-character `fill`; the keys after it reached
+    the page's own keyboard shortcuts and it navigated to Leads Center, while
+    characters went missing from the post (bug report, BBDTX Advertising).
+    """
+
+
+class _FocusGuard:
+    """Called before every key of a `fill`: the field must still have focus."""
+
+    def __init__(self, actions, frame_id, element, total: int):
+        self.a, self.f, self.el, self.total = actions, frame_id, element, total
+
+    def where(self) -> str:
+        try:
+            got = self.a.inj.call(self.f, _FOCUS_JS, {"objectId": self.el})
+        except Exception as exc:  # the field's world went away
+            return "unreadable (%s)" % type(exc).__name__
+        return got if isinstance(got, str) else "unreadable"
+
+    def __call__(self, index: int, units) -> None:
+        seen = self.where()
+        if seen in ("in", "editable"):
+            return
+        until = time.monotonic() + FOCUS_RETURN_S
+        while time.monotonic() < until:
+            time.sleep(_FOCUS_POLL_S)
+            seen = self.where()
+            if seen in ("in", "editable"):
+                return
+        typed = sum(len(u) for u in units[:index])
+        raise FocusLeftField(
+            "fill: typing stopped after %d of %d characters: the field lost the "
+            "focus to %s and did not get it back within %.0f s, so the rest was "
+            "not typed anywhere" % (typed, self.total, seen, FOCUS_RETURN_S))
+
+
 class CredentialActions(Actions):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Fork-only: text is typed one grapheme cluster at a time
+        # (`_grapheme_keyboard`), so "🇿🇦" is one insert, not two.
+        _type_graphemes(self.keyboard)
+        self._typing_target = None
+
+    def _reach_field(self, f, element, deadline):
+        # `fill` reaches its field and then types into it; remember which, so
+        # `_type` can keep checking it still has the focus.
+        self._typing_target = (f, element)
+        return super()._reach_field(f, element, deadline)
+
+    def _type(self, text, delay_ms=None):
+        target, self._typing_target = self._typing_target, None
+        if target is None or not hasattr(self.keyboard, "guard"):
+            return super()._type(text, delay_ms)
+        self.keyboard.guard = _FocusGuard(self, target[0], target[1], len(text))
+        try:
+            return super()._type(text, delay_ms)
+        finally:
+            self.keyboard.guard = None
+
     def fill(self, selector: str, text: str, *, timeout: float = 30.0,
              frame_id: str | None = None, element_id: str | None = None,
              expect_origin: str | None = None,
