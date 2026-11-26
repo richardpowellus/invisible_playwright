@@ -122,6 +122,39 @@ class _FocusGuard:
             "not typed anywhere" % (typed, self.total, seen, FOCUS_RETURN_S))
 
 
+#: Where a click would leave the selection in an editor, instead of around
+#: its root. The injected `fill` selects an editable host with
+#: `selectNodeContents(host)`, so both ends of the selection sit ON the host,
+#: outside the blocks an editor keeps inside it. A key is fine with that (an
+#: editor applies it to its own model), but a composition is not: Firefox
+#: commits it natively over the selected range, which removes the editor's
+#: block wrappers. Draft.js (Meta Business Suite's composer) then threw on every
+#: event and dropped every edit it made itself - spaces after emoji, the
+#: apostrophe, newlines - for the rest of the text (2026-11-26). So the ends
+#: are moved into the first and last leaf, and an empty field gets a caret
+#: inside its block, where a person's click puts it. A selection the page
+#: already placed elsewhere is left alone.
+_EDITOR_SELECTION_JS = (
+    "(injected, el) => {"
+    "  if (!el.isContentEditable) return 'not-editable';"
+    "  const s = el.ownerDocument.getSelection();"
+    "  if (!s || !s.rangeCount) return 'no-selection';"
+    "  const r = s.getRangeAt(0);"
+    "  if (r.startContainer !== el && r.endContainer !== el) return 'kept';"
+    "  const first = (n) => { for (;;) { const c = n.firstChild;"
+    "      if (!c) return [n, 0]; if (c.nodeType === 1 && c.tagName === 'BR') return [n, 0];"
+    "      if (c.nodeType !== 1 && c.nodeType !== 3) return [n, 0]; n = c; } };"
+    "  const last = (n) => { for (;;) { const c = n.lastChild;"
+    "      if (!c) return [n, n.nodeType === 3 ? n.data.length : 0];"
+    "      if (c.nodeType === 1 && c.tagName === 'BR') return [n, n.childNodes.length - 1];"
+    "      if (c.nodeType !== 1 && c.nodeType !== 3) return [n, n.childNodes.length]; n = c; } };"
+    "  const [a, ao] = first(el);"
+    "  const empty = el.textContent.replace(/[\\u200b\\ufeff]/g, '') === '';"
+    "  const [b, bo] = empty ? [a, ao] : last(el);"
+    "  s.setBaseAndExtent(a, ao, b, bo);"
+    "  return empty ? 'caret' : 'leaves'; }")
+
+
 class CredentialActions(Actions):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -140,6 +173,10 @@ class CredentialActions(Actions):
         target, self._typing_target = self._typing_target, None
         if target is None or not hasattr(self.keyboard, "guard"):
             return super()._type(text, delay_ms)
+        try:
+            self.inj.call(target[0], _EDITOR_SELECTION_JS, {"objectId": target[1]})
+        except EvaluationError:
+            pass  # the field went away: the focus guard says so at the next key
         self.keyboard.guard = _FocusGuard(self, target[0], target[1], len(text))
         try:
             return super()._type(text, delay_ms)
